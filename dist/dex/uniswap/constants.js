@@ -1,0 +1,1 @@
+export const UNISWAP_FEE = 3000;

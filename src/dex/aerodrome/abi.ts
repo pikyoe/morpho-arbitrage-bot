@@ -1,0 +1,1 @@
+export { AERODROME_ROUTER_ABI } from "../../abi/aerodromeRouter.js";
