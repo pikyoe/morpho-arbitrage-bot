@@ -1,8 +1,11 @@
 import { network } from "hardhat";
+import { ensureChain } from "./utils/validateNetwork.js";
 
 async function main() {
   const connection = await network.create("baseSepolia");
   const { ethers } = connection;
+
+  ensureChain(84532n);
 
   const [deployer] = await ethers.getSigners();
 

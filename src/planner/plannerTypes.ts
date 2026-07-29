@@ -14,6 +14,8 @@ export interface SwapStep {
 
     minAmountOut: bigint;
 
+    deadline?: bigint | number;
+
 }
 
 export interface ExecutionPlan {

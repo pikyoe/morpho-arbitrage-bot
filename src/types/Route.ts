@@ -6,11 +6,15 @@ export interface SwapStep {
 
     tokenOut: string;
 
+    fee: number;
+
     amountIn: bigint;
 
     minAmountOut: bigint;
 
     data: string;
+
+    deadline?: bigint | number;
 
 }
 

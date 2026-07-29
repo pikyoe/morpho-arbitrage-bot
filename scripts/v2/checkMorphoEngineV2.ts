@@ -34,6 +34,16 @@ async function main(){
         process.env.ARBITRAGE_ENGINE_V2_ADDRESS
     );
 
+    // Also check engine internal state if set
+    try {
+        const engineAddr = process.env.ARBITRAGE_ENGINE_V2_ADDRESS!;
+        const engine = await ethers.getContractAt("ArbitrageEngineV2", engineAddr);
+        console.log("Engine flashLoanToken:", await engine.flashLoanToken());
+        console.log("Engine flashLoanAmount:", (await engine.flashLoanAmount()).toString());
+    } catch (e) {
+        console.warn("Could not inspect engine state:", e);
+    }
+
 }
 
 

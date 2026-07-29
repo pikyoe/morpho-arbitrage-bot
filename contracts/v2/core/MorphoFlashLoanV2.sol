@@ -31,6 +31,7 @@ contract MorphoFlashLoanV2 is Ownable {
 
     address public flashToken;
 
+    bool public paused;
 
 
     modifier onlyEngine()
@@ -48,6 +49,14 @@ contract MorphoFlashLoanV2 is Ownable {
     {
         if(msg.sender != morpho)
             revert Errors.Unauthorized();
+
+        _;
+    }
+
+    modifier whenNotPaused()
+    {
+        if(paused)
+            revert Errors.InvalidState();
 
         _;
     }
@@ -77,6 +86,16 @@ contract MorphoFlashLoanV2 is Ownable {
 
 
 
+
+    function setPaused(
+        bool status
+    )
+        external
+        onlyOwner
+    {
+        paused = status;
+        emit Events.Paused(status);
+    }
 
     function setEngine(
         address _engine
@@ -114,7 +133,20 @@ contract MorphoFlashLoanV2 is Ownable {
     )
         external
         onlyEngine
+        whenNotPaused
     {
+
+
+        if(
+            flashToken != address(0)
+        )
+            revert Errors.InProgress();
+
+
+        if(
+            token == address(0)
+        )
+            revert Errors.InvalidToken();
 
 
         if(
@@ -159,6 +191,7 @@ contract MorphoFlashLoanV2 is Ownable {
     )
         external
         onlyMorpho
+        whenNotPaused
     {
 
 
@@ -238,7 +271,7 @@ contract MorphoFlashLoanV2 is Ownable {
         IERC20(token)
             .forceApprove(
                 morpho,
-                balance
+                assets
             );
 
 
@@ -247,8 +280,10 @@ contract MorphoFlashLoanV2 is Ownable {
 
         emit Events.FlashLoanRepaid(
             token,
-            balance
+            assets
         );
+
+        flashToken = address(0);
 
     }
 
@@ -265,6 +300,12 @@ contract MorphoFlashLoanV2 is Ownable {
         external
         onlyOwner
     {
+
+        if(
+            token == flashToken
+        )
+            revert Errors.InProgress();
+
 
         uint256 amount =
             IERC20(token)

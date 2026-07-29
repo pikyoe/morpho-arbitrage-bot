@@ -1,5 +1,6 @@
 import { network } from "hardhat";
 import "dotenv/config";
+import { ensureChain } from "../utils/validateNetwork.js";
 
 
 async function main() {
@@ -10,9 +11,14 @@ async function main() {
     const { ethers } =
         connection;
 
+    ensureChain(84532n, ethers);
+
 
     const [deployer] =
         await ethers.getSigners();
+
+    console.log("Network : baseSepolia");
+    console.log("Signer  :", deployer.address);
 
 
     const morphoFlashLoan =
@@ -53,9 +59,9 @@ async function main() {
 
     const engine =
         await Factory.deploy(
-            deployer.address,
-            morphoFlashLoan
-        );
+         morphoFlashLoan,
+         deployer.address
+       );
 
 
     await engine.waitForDeployment();

@@ -90,7 +90,16 @@ contract UniswapV3AdapterV2 is
             uint256 amountOut
         )
     {
+        if (step.amountIn == 0) {
+            revert Errors.InvalidAmount();
+        }
 
+        IERC20(step.tokenIn)
+            .safeTransferFrom(
+                msg.sender,
+                address(this),
+                step.amountIn
+            );
 
         IERC20(step.tokenIn)
             .forceApprove(
@@ -98,41 +107,33 @@ contract UniswapV3AdapterV2 is
                 step.amountIn
             );
 
+        uint256 deadline = step.deadline == 0 ? block.timestamp + 30 : step.deadline;
 
+        if (deadline <= block.timestamp) {
+            revert Errors.DeadlineExpired();
+        }
 
         amountOut =
             IUniswapV3Router(router)
             .exactInputSingle(
                 IUniswapV3Router
                 .ExactInputSingleParams({
-
-                    tokenIn:
-                        step.tokenIn,
-
-                    tokenOut:
-                        step.tokenOut,
-
-                    fee:
-                        3000,
-
-                    recipient:
-                        engine,
-
-                    deadline:
-                        block.timestamp + 300,
-
-                    amountIn:
-                        step.amountIn,
-
-                    amountOutMinimum:
-                        step.minAmountOut,
-
-                    sqrtPriceLimitX96:
-                        0
+                    tokenIn: step.tokenIn,
+                    tokenOut: step.tokenOut,
+                    fee: step.fee,
+                    recipient: engine,
+                    deadline: deadline,
+                    amountIn: step.amountIn,
+                    amountOutMinimum: step.minAmountOut,
+                    sqrtPriceLimitX96: 0
                 })
             );
 
-
+        IERC20(step.tokenIn)
+            .forceApprove(
+                router,
+                0
+            );
 
         emit Events.SwapExecuted(
             address(this),

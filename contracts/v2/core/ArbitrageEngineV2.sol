@@ -6,24 +6,22 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-import {
-    IMorpho,
-    IMorphoFlashLoanCallback
-} from "../../interfaces/IMorpho.sol";
+import "../interfaces/IMorphoFlashLoan.sol";
+import "../interfaces/IFlashLoanReceiver.sol";
 import "../interfaces/IAdapter.sol";
 
 import "../libraries/Strategy.sol";
 import "../libraries/Errors.sol";
 import "../libraries/Events.sol";
 
-contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard {
+contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     ////////////////////////////////////////////////////////////
     //                     IMMUTABLES
     ////////////////////////////////////////////////////////////
 
-    address public immutable morpho;
+    address public immutable morphoFlashLoan;
 
     ////////////////////////////////////////////////////////////
     //                     STORAGE
@@ -35,7 +33,11 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
 
     uint256 public flashLoanAmount;
 
+    bool public paused;
+
     mapping(address => bool) public authorizedCaller;
+
+    mapping(address => bool) public approvedAdapter;
 
     ////////////////////////////////////////////////////////////
     //                     MODIFIERS
@@ -48,9 +50,16 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
         _;
     }
 
-    modifier onlyMorpho() {
-        if (msg.sender != morpho) {
+    modifier onlyFlashLoan() {
+        if (msg.sender != morphoFlashLoan) {
             revert Errors.Unauthorized();
+        }
+        _;
+    }
+
+    modifier whenNotPaused() {
+        if (paused) {
+            revert Errors.InvalidState();
         }
         _;
     }
@@ -59,8 +68,8 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
     //                     CONSTRUCTOR
     ////////////////////////////////////////////////////////////
 
-    constructor(address _morpho, address _profitReceiver) Ownable(msg.sender) {
-        if (_morpho == address(0)) {
+    constructor(address _morphoFlashLoan, address _profitReceiver) Ownable(msg.sender) {
+        if (_morphoFlashLoan == address(0)) {
             revert Errors.InvalidAddress();
         }
 
@@ -68,7 +77,7 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
             revert Errors.InvalidAddress();
         }
 
-        morpho = _morpho;
+        morphoFlashLoan = _morphoFlashLoan;
         profitReceiver = _profitReceiver;
     }
 
@@ -94,6 +103,21 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
         profitReceiver = receiver;
     }
 
+    function setPaused(bool status) external onlyOwner {
+        paused = status;
+        emit Events.Paused(status);
+    }
+
+    function setApprovedAdapter(address adapter, bool status) external onlyOwner {
+        if (adapter == address(0)) {
+            revert Errors.InvalidAddress();
+        }
+
+        approvedAdapter[adapter] = status;
+
+        emit Events.AdapterApproved(adapter, status);
+    }
+
     ////////////////////////////////////////////////////////////
     //                  FLASH LOAN ENTRYPOINT
     ////////////////////////////////////////////////////////////
@@ -102,7 +126,7 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
         address token,
         uint256 amount,
         Strategy.Route calldata route
-    ) external onlyAuthorized nonReentrant {
+    ) external onlyAuthorized whenNotPaused nonReentrant {
         if (token == address(0)) {
             revert Errors.InvalidToken();
         }
@@ -115,30 +139,36 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
             revert Errors.InProgress();
         }
 
-        _validateRoute(route);
+        _validateRoute(route, token);
+
+        emit Events.RouteValidated(token, msg.sender);
 
         flashLoanToken = token;
         flashLoanAmount = amount;
 
         emit Events.ArbitrageStarted(token, amount);
 
-        IMorpho(morpho).flashLoan(token, amount, abi.encode(route));
+        IMorphoFlashLoan(morphoFlashLoan).requestFlashLoan(token, amount, abi.encode(route));
     }
 
     ////////////////////////////////////////////////////////////
     //                  FLASH LOAN CALLBACK
     ////////////////////////////////////////////////////////////
 
-    function onMorphoFlashLoan(uint256 assets, bytes calldata data)
-        external
-        onlyMorpho
-        nonReentrant
-    {
-        if (assets == 0) {
+    function executeOperation(
+        address token,
+        uint256 amount,
+        bytes calldata data
+    ) external onlyFlashLoan whenNotPaused nonReentrant {
+        if (amount == 0) {
             revert Errors.InvalidAmount();
         }
 
-        if (assets != flashLoanAmount) {
+        if (token != flashLoanToken) {
+            revert Errors.InvalidToken();
+        }
+
+        if (amount != flashLoanAmount) {
             revert Errors.InvalidAmount();
         }
 
@@ -151,11 +181,11 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
         }
 
         Strategy.Route memory route = abi.decode(data, (Strategy.Route));
-        _validateRoute(route);
+        _validateRoute(route, token);
 
-        emit Events.FlashLoanReceived(flashLoanToken, assets);
+        emit Events.FlashLoanReceived(flashLoanToken, amount);
 
-        uint256 currentAmount = _executeRoute(route, assets);
+        _executeRoute(route, amount);
 
         _approveRepayment();
 
@@ -168,7 +198,7 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
     //                  INTERNAL VALIDATION
     ////////////////////////////////////////////////////////////
 
-    function _validateRoute(Strategy.Route memory route) internal view {
+    function _validateRoute(Strategy.Route memory route, address token) internal view {
         if (route.swaps.length == 0) {
             revert Errors.InvalidRoute();
         }
@@ -177,10 +207,20 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
             revert Errors.InvalidToken();
         }
 
+        if (route.swaps[0].tokenIn != token) {
+            revert Errors.InvalidRoute();
+        }
+
+        address previousTokenOut = route.swaps[0].tokenOut;
+
         for (uint256 i = 0; i < route.swaps.length; i++) {
             Strategy.SwapStep memory step = route.swaps[i];
 
             if (step.adapter == address(0)) {
+                revert Errors.InvalidAdapter();
+            }
+
+            if (!approvedAdapter[step.adapter]) {
                 revert Errors.InvalidAdapter();
             }
 
@@ -191,12 +231,24 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
             if (step.tokenOut == address(0)) {
                 revert Errors.InvalidToken();
             }
+
+            if (i > 0 && step.tokenIn != previousTokenOut) {
+                revert Errors.InvalidRoute();
+            }
+
+            previousTokenOut = step.tokenOut;
         }
 
         Strategy.SwapStep memory lastSwap = route.swaps[route.swaps.length - 1];
-        if (lastSwap.tokenOut != flashLoanToken) {
+        if (lastSwap.tokenOut != token) {
             revert Errors.InvalidRoute();
         }
+    }
+
+    // View helper to validate a route off-chain
+    function validateRoute(Strategy.Route calldata route, address token) external view returns (bool) {
+        _validateRoute(route, token);
+        return true;
     }
 
     function _executeRoute(Strategy.Route memory route, uint256 initialAmount)
@@ -229,6 +281,12 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
 
         amountOut = IAdapter(step.adapter).swap(step);
 
+        if (amountOut < step.minAmountOut) {
+            revert Errors.ZeroOutput();
+        }
+
+        IERC20(step.tokenIn).forceApprove(step.adapter, 0);
+
         emit Events.SwapExecuted(
             step.adapter,
             step.tokenIn,
@@ -244,17 +302,13 @@ contract ArbitrageEngineV2 is Ownable, IMorphoFlashLoanCallback, ReentrancyGuard
             revert Errors.RepaymentFailed();
         }
 
-        IERC20(flashLoanToken).forceApprove(morpho, repayBalance);
+        IERC20(flashLoanToken).safeTransfer(morphoFlashLoan, flashLoanAmount);
 
-        emit Events.FlashLoanRepaid(flashLoanToken, repayBalance);
+        emit Events.FlashLoanRepaid(flashLoanToken, flashLoanAmount);
     }
 
     function _sendProfit(Strategy.Route memory route) internal returns (uint256 profitAmount) {
-        if (route.profitToken == flashLoanToken) {
-            profitAmount = IERC20(flashLoanToken).balanceOf(address(this)) - flashLoanAmount;
-        } else {
-            profitAmount = IERC20(route.profitToken).balanceOf(address(this));
-        }
+        profitAmount = IERC20(route.profitToken).balanceOf(address(this));
 
         if (profitAmount < route.minProfit) {
             revert Errors.InsufficientProfit();

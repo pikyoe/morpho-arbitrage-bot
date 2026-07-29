@@ -1,4 +1,5 @@
 import { network } from "hardhat";
+import { ensureChain } from "./utils/validateNetwork.js";
 
 async function main() {
 
@@ -7,6 +8,8 @@ async function main() {
 
     const { ethers } =
         connection;
+
+    ensureChain(84532n);
 
 
     const [deployer] =

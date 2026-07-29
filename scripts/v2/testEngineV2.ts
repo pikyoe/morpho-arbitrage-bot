@@ -8,7 +8,7 @@ async function main() {
         await network.create("baseSepolia");
 
     const { ethers } =
-        connection;
+        connection as any;
 
 
     const [signer] =
@@ -69,88 +69,34 @@ async function main() {
 
 
 
-    const route =
-    {
-        swaps:
-        [
+    const route = {
+        swaps: [
             {
                 adapter,
-
-                tokenIn:
-                    WETH,
-
-                tokenOut:
-                    USDC,
-
-                amountIn:
-                    amount,
-
-                minAmountOut:
-                    0,
-
-                data:
-                    "0x"
+                tokenIn: WETH,
+                tokenOut: USDC,
+                fee: 3000,
+                amountIn: amount,
+                minAmountOut: 1n,
+                data: "0x",
+                deadline: BigInt(Math.floor(Date.now() / 1000) + 30)
             },
-
-
             {
                 adapter,
-
-                tokenIn:
-                    USDC,
-
-                tokenOut:
-                    WETH,
-
-                amountIn:
-                    0,
-
-                minAmountOut:
-                    0,
-
-                data:
-                    "0x"
+                tokenIn: USDC,
+                tokenOut: WETH,
+                fee: 3000,
+                amountIn: 0n,
+                minAmountOut: 1n,
+                data: "0x",
+                deadline: BigInt(Math.floor(Date.now() / 1000) + 30)
             }
         ],
-
-
-        profitToken:
-            WETH,
-
-
-        minProfit:
-            0
+        profitToken: WETH,
+        minProfit: 0n
     };
 
 
-
-    const abi =
-        ethers.AbiCoder.defaultAbiCoder();
-
-
-
-    const data =
-        abi.encode(
-        [
-            "tuple(tuple(address adapter,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,bytes data)[] swaps,address profitToken,uint256 minProfit)"
-        ],
-        [
-            route
-        ]);
-
-
-
-    console.log("======================");
-    console.log("Route");
-    console.log("======================");
-
-
-    console.log(
-        "Swap 1:",
-        WETH,
-        "->",
-        USDC
-    );
 
 
     console.log(
@@ -173,30 +119,12 @@ async function main() {
     console.log("======================");
 
 
-    await engine.executeArbitrage.staticCall(
-        WETH,
-        amount,
-        data
-    );
-
-
-    console.log(
-        "Simulation OK"
-    );
-
-
-
-    console.log("======================");
-    console.log("Executing V2 arbitrage...");
-    console.log("======================");
-
-
 
     const tx =
         await engine.executeArbitrage(
             WETH,
             amount,
-            data
+            route
         );
 
 
