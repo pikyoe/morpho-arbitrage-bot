@@ -30,26 +30,32 @@ contract AerodromeAdapterV2 is
 
     constructor(
         address initialOwner,
-        address _router
+        address _router,
+        address engineAddress
     )
         Ownable(initialOwner)
     {
         if (_router == address(0))
             revert Errors.InvalidAddress();
 
+        if (engineAddress == address(0))
+            revert Errors.InvalidAddress();
+
         router = _router;
+        engine = engineAddress;
     }
 
     function setEngine(
-        address _engine
+        address newEngine
     )
         external
         onlyOwner
     {
-        if (_engine == address(0))
+        if (newEngine == address(0)) {
             revert Errors.InvalidAddress();
+        }
 
-        engine = _engine;
+        engine = newEngine;
     }
 
     function swap(
@@ -59,6 +65,20 @@ contract AerodromeAdapterV2 is
         onlyEngine
         returns (uint256 amountOut)
     {
+        if (step.amountIn == 0) {
+            revert Errors.InvalidAmount();
+        }
+
+        IERC20(step.tokenIn).safeTransferFrom(
+            msg.sender,
+            address(this),
+            step.amountIn
+        );
+
+        if (step.data.length == 0) {
+            revert Errors.InvalidRoute();
+        }
+
         (bool stable, address factory) =
             abi.decode(
                 step.data,
@@ -81,6 +101,12 @@ contract AerodromeAdapterV2 is
             factory: factory
         });
 
+        uint256 deadline = step.deadline == 0 ? block.timestamp + 30 : step.deadline;
+
+        if (deadline <= block.timestamp) {
+            revert Errors.DeadlineExpired();
+        }
+
         uint256[] memory amounts =
             IAerodromeRouter(router)
                 .swapExactTokensForTokens(
@@ -88,11 +114,20 @@ contract AerodromeAdapterV2 is
                     step.minAmountOut,
                     routes,
                     engine,
-                    block.timestamp + 300
+                    deadline
                 );
+
+        if (amounts.length == 0) {
+            revert Errors.ZeroOutput();
+        }
 
         amountOut =
             amounts[amounts.length - 1];
+
+        IERC20(step.tokenIn).forceApprove(
+            router,
+            0
+        );
 
         emit Events.SwapExecuted(
             address(this),

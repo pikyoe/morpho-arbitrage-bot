@@ -1,0 +1,11 @@
+{
+  "models": [
+    {
+      "title": "AgentRouter",
+      "provider": "openai",
+      "model": "gpt-5.6",
+      "apiKey": "sk-dQVZTg1xgXCHJnKet13MJ4If1Ef9PnhulgLIR9TBLfGARPec",
+      "apiBase": "https://api.agentrouter.to/api/agentic-api"
+    }
+  ]
+}
