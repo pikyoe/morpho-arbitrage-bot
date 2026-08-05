@@ -1,7 +1,30 @@
 node_modules
 .env
+.env.*
+!.env.example
+*.env
+!.env.example
 artifacts
 cache
 coverage
 typechain-types
 logs/*
+# Security - never commit sensitive data
+private_keys/
+secrets/
+*.key
+*.pem
+# Temporary files
+*.log
+*.tmp
+tmp-*
+debugsel.*
+# OS files
+.DS_Store
+Thumbs.db
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
