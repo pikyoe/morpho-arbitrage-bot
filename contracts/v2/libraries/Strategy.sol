@@ -11,11 +11,15 @@ library Strategy {
 
         address tokenOut;
 
+        uint24 fee;
+
         uint256 amountIn;
 
         uint256 minAmountOut;
 
         bytes data; 
+
+        uint256 deadline;
     }
 
     struct Route {

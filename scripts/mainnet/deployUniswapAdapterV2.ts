@@ -1,23 +1,32 @@
-import { ethers } from "hardhat";
+import hre from "hardhat";
+import loadEnvForNetwork from "../utils/loadEnv.js";
+import { ensureChain } from "../utils/validateNetwork.js";
 
 async function main() {
+  const connection: any = await hre.network.connect();
+  const { ethers } = connection;
 
-    const [deployer] =
-        await ethers.getSigners();
+  loadEnvForNetwork(hre);
+  ensureChain([8453n, 31337n, 84532n], connection);
 
-    const Factory =
-        await ethers.getContractFactory(
-            "UniswapV3AdapterV2"
-        );
+  const [deployer] = await ethers.getSigners();
+  const networkName = (hre.network as any).name ?? "unknown";
+  const chainId = (hre.network as any).config?.chainId ?? "unknown";
+  console.log("Network:", networkName, "chainId:", chainId);
+  console.log("Signer:", deployer.address);
 
-    const adapter =
-        await Factory.deploy(
+  const Factory = await ethers.getContractFactory("UniswapV3AdapterV2");
 
-            deployer.address,
+  const router = process.env.UNISWAP_ROUTER_ADDRESS;
+  if (!router) {
+    throw new Error("UNISWAP_ROUTER_ADDRESS missing");
+  }
+  if (!ethers.isAddress(router)) {
+    throw new Error("Invalid UNISWAP_ROUTER_ADDRESS");
+  }
 
-            process.env.UNISWAP_ROUTER_ADDRESS!
-
-        );
+  // For now, use deployer address as placeholder for engine (will be set later)
+  const adapter = await Factory.deploy(deployer.address, router, deployer.address);
 
     await adapter.waitForDeployment();
 

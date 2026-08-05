@@ -39,6 +39,15 @@ library Events {
         address indexed adapter
     );
 
+    event AdapterApproved(
+        address indexed adapter,
+        bool status
+    );
+
+    event Paused(
+        bool status
+    );
+
     event EngineUpdated(
         address indexed engine
     );
@@ -47,4 +56,9 @@ library Events {
         address indexed caller,
         bool status
     );
+    
+        event RouteValidated(
+            address indexed token,
+            address indexed caller
+        );
 }

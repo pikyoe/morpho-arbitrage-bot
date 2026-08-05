@@ -13,23 +13,19 @@ library Errors {
 
     error InvalidAdapter();
 
-    error AdapterNotAuthorized();
-
-    error FlashLoanFailed();
-
-    error SwapFailed();
-
     error RepaymentFailed();
 
     error InsufficientProfit();
 
     error ZeroOutput();
 
+    error InvalidSlippage();
+
+    error RescueFailed();
+
     error DeadlineExpired();
 
     error InvalidToken();
-
-    error InvalidCaller();
 
     error InsufficientBalance();
 
