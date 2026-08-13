@@ -9,6 +9,8 @@ import {
 } from "ethers";
 
 import { PoolCache } from "../../bot/scanner/PoolCache.js";
+import { PoolLoader } from "../../bot/scanner/PoolLoader.js";
+import { SubgraphPoolLoader } from "../../bot/scanner/SubgraphPoolLoader.js";
 import { UniswapV3DexProvider } from "../../bot/scanner/quote/UniswapV3DexProvider.js";
 import { SushiSwapDexProvider } from "../../bot/scanner/quote/SushiSwapDexProvider.js";
 import { PancakeSwapDexProvider } from "../../bot/scanner/quote/PancakeSwapDexProvider.js";
@@ -40,6 +42,8 @@ const WATCH_PAIR_B = process.env.WATCH_TOKEN_B || TOKENS.AERO;
 const WATCH_MODE = (process.env.WATCH_MODE || "single").toLowerCase();
 const WATCH_PAIRS_CSV = process.env.WATCH_PAIRS || ""; // e.g. "0xAAA,0xBBB;0xCCC,0xDDD"
 const SCAN_BATCH_SIZE = Number(process.env.SCAN_BATCH_SIZE || 8);
+const POOL_REFRESH_LOOPS = Number(process.env.WATCH_POOL_REFRESH_LOOPS || 12); // refresh pool cache every N loops (0 = never)
+const POOL_RPC_FALLBACK = process.env.POOL_RPC_FALLBACK !== "false"; // fallback to factory RPC when subgraph is thin
 const MIN_LIQUIDITY_USD = Number(process.env.MIN_LIQUIDITY_USD || 10000);
 const MIN_DEX_VARIETY = Number(process.env.MIN_DEX_VARIETY || 2);
 const MAX_PAIRS_PER_SCAN = Number(process.env.MAX_PAIRS_PER_SCAN || 200);
@@ -424,6 +428,70 @@ async function main() {
     const amountInSingle = await usdToTokenAmount(TEST_AMOUNT_USD, WATCH_PAIR_A);
     console.log(`Single-pair monitoring amount: ${formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${TEST_AMOUNT_USD})\n`);
 
+    // Preload pool cache from subgraphs (lightweight GraphQL; avoids RPC rate limits) — enables MIN_DEX_VARIETY/MIN_LIQUIDITY filters.
+    const SUBGRAPH_POOL_LIMIT_N = Number(process.env.SUBGRAPH_POOL_LIMIT || 20);
+
+    // (Re)load pool cache: subgraph first (light); factory RPC fallback when subgraph thin/failed.
+    async function refreshPoolCache(): Promise<void> {
+        poolCache.clear();
+        const subgraphLoader = new SubgraphPoolLoader(poolCache);
+        const perDexCount: Record<string, number> = {};
+        const triedDexes: string[] = [];
+
+        // 1) Subgraph (preferred: includes TVL → MIN_LIQUIDITY_USD works)
+        for (const [name, subgraphUrl] of [
+            ["UniswapV3", process.env.UNISWAP_SUBGRAPH_URL],
+            ["SushiSwap", process.env.SUSHISWAP_SUBGRAPH_URL],
+            ["PancakeSwap", process.env.PANCAKESWAP_SUBGRAPH_URL],
+            ["Aerodrome", process.env.AERODROME_SUBGRAPH_URL],
+        ] as const) {
+            if (!subgraphUrl) continue;
+            const before = poolCache.size();
+            try {
+                if (name === "Aerodrome") await subgraphLoader.loadAerodrome(subgraphUrl, SUBGRAPH_POOL_LIMIT_N);
+                else if (name === "SushiSwap") await subgraphLoader.loadSushiSwap(subgraphUrl, SUBGRAPH_POOL_LIMIT_N);
+                else if (name === "PancakeSwap") await subgraphLoader.loadPancakeSwap(subgraphUrl, SUBGRAPH_POOL_LIMIT_N);
+                else await subgraphLoader.loadUniswap(subgraphUrl, SUBGRAPH_POOL_LIMIT_N);
+            } catch (e: any) {
+                console.log(`  ⚠️ Subgraph ${name} load failed (${e?.message || String(e)})`);
+            }
+            const added = poolCache.size() - before;
+            perDexCount[name] = added;
+            triedDexes.push(name);
+        }
+
+        // 2) Factory RPC fallback for DEXes with no subgraph pools (uses WS/RPC rate limiter)
+        if (POOL_RPC_FALLBACK) {
+            const rpcLoader = new PoolLoader(provider, poolCache);
+            for (const [name, factoryAddr] of [
+                ["UniswapV3", process.env.UNISWAP_FACTORY_ADDRESS],
+                ["SushiSwap", process.env.SUSHISWAP_FACTORY_ADDRESS],
+                ["PancakeSwap", process.env.PANCAKESWAP_FACTORY_ADDRESS],
+                ["Aerodrome", process.env.AERODROME_FACTORY_ADDRESS],
+            ] as const) {
+                if (!factoryAddr) continue;
+                if ((perDexCount[name] ?? 0) > 0) continue; // subgraph already provided
+                const before = poolCache.size();
+                try {
+                    if (name === "Aerodrome") await rpcLoader.loadAerodrome(factoryAddr);
+                    else if (name === "SushiSwap") await rpcLoader.loadSushiSwap(factoryAddr);
+                    else if (name === "PancakeSwap") await rpcLoader.loadPancakeSwap(factoryAddr);
+                    else await rpcLoader.loadUniswap(factoryAddr);
+                } catch (e: any) {
+                    console.log(`  ⚠️ RPC fallback ${name} failed (${e?.message || String(e)})`);
+                }
+                const added = poolCache.size() - before;
+                if (added > 0) console.log(`  📦 RPC fallback +${name}: ${added} pools`);
+            }
+        }
+
+        const loaded = triedDexes.filter(d => (perDexCount[d] ?? 0) > 0 || poolCache.getAll().some(p => p.dex.toLowerCase() === d.toLowerCase()));
+        console.log(`  📦 PoolCache: ${poolCache.size()} pools (${triedDexes.map(d => `${d}=${perDexCount[d] ?? "rpc"}`).join(", ")})`);
+    }
+
+    await refreshPoolCache();
+    console.log();
+
     const scanPairs = resolveScanPairs();
 
     let loop = 0;
@@ -447,6 +515,16 @@ async function main() {
 
         // -------- Multi-pair mode (all/list) --------
         if (WATCH_MODE === "all" || WATCH_MODE === "list") {
+            // Periodic pool refresh (subgraph first, RPC fallback)
+            if (POOL_REFRESH_LOOPS > 0 && loop % POOL_REFRESH_LOOPS === 0) {
+                if (VERBOSE) console.log(`  🔄 Refreshing pool cache (loop ${loop})`);
+                try {
+                    await refreshPoolCache();
+                } catch (e: any) {
+                    console.log(`  ⚠️ Pool refresh failed (${e?.message || String(e)}) — using previous cache`);
+                }
+            }
+
             const topCandidates = await scanAllPairs(scanPairs, dexProviders, amountFor, formatAmount);
             const best = topCandidates[0] ?? null;
 
