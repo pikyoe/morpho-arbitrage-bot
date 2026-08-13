@@ -3,6 +3,8 @@ export interface ContractAddresses {
     arbitrageEngine: string;
     uniswapAdapter: string;
     aerodromeAdapter: string;
+    sushiSwapAdapter?: string;
+    pancakeSwapAdapter?: string;
 }
 
 export interface DeploymentMetadata {

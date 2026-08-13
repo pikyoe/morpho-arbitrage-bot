@@ -6,13 +6,102 @@ export interface GasConfig {
     gasLimit?: bigint;
 }
 
+/** Result returned by executeFlashLoan for convenient callers (watchAndExecute, runBot). */
+export interface FlashLoanResult {
+    success: boolean;
+    txHash?: string;
+    netProfitUSD?: number;
+    error?: string;
+}
+
+/**
+ * SwapStep as expected by the deployed ArbitrageEngineV2 route struct:
+ * (address adapter, address tokenIn, address tokenOut, uint24 fee,
+ *  uint256 amountIn, uint256 minAmountOut, bytes data, uint256 deadline)
+ */
+export interface SwapStep {
+    adapter: string;
+    tokenIn: string;
+    tokenOut: string;
+    fee: number | bigint;
+    amountIn: bigint;
+    minAmountOut: bigint;
+    data: string;
+    deadline: number | bigint;
+}
+
+/**
+ * Route as expected by executeArbitrage(token, amount, route):
+ * { swaps: SwapStep[], profitToken, minProfit }
+ */
+export interface Route {
+    swaps: SwapStep[];
+    profitToken: string;
+    minProfit: bigint;
+}
+
+/** Given opportunity objects produced by the scanner (may carry `route` or flat `steps`), build a Route. */
+function normalizeRoute(opp: any): Route {
+    // Modern format: opp.route = { swaps, profitToken, minProfit }
+    if (opp?.route && Array.isArray(opp.route.swaps) && opp.route.profitToken) {
+        return {
+            swaps: opp.route.swaps,
+            profitToken: opp.route.profitToken,
+            minProfit: BigInt(opp.route.minProfit ?? 0)
+        };
+    }
+
+    // Legacy flat format: opp.steps = [{ adapter, tokenIn, tokenOut, fee, amountIn, amountOut, dex, ... }]
+    if (opp?.steps && Array.isArray(opp.steps) && opp.steps.length > 0) {
+        const profitToken = opp.route?.profitToken || opp.steps[0]?.to || opp.steps[0]?.tokenOut;
+        const lastStep = opp.steps[opp.steps.length - 1];
+        const inputIsProfitToken =
+            profitToken.toLowerCase() === String(opp?.steps?.[0]?.from || opp?.steps?.[0]?.tokenIn || "").toLowerCase();
+
+        const swaps: SwapStep[] = opp.steps.map((s: any) => ({
+            adapter: s.adapter || s.dex, // legacy: `dex` is the adapter name; resolved later
+            tokenIn: s.tokenIn || s.from,
+            tokenOut: s.tokenOut || s.to,
+            fee: Number(s.fee ?? 0),
+            amountIn: BigInt(s.amountIn ?? s.amount),
+            minAmountOut: BigInt(s.amountOut ?? 0),
+            data: s.data || "0x",
+            deadline: Number(s.deadline ?? (Math.floor(Date.now() / 1000) + 60))
+        }));
+
+        return {
+            swaps,
+            profitToken,
+            minProfit: BigInt(opp.profit ?? 0)
+        };
+    }
+
+    throw new Error("FlashLoanExecutor: unsupported opportunity shape (no route.swaps or steps)");
+}
+
+/**
+ * Executes a cross-DEX arbitrage route through the deployed ArbitrageEngineV2
+ * using a Morpho flash loan.
+ *
+ * Engine ABI: executeArbitrage(address token, uint256 amount, Route route)
+ * where Route = { SwapStep[] swaps, address profitToken, uint256 minProfit }
+ */
 export class FlashLoanExecutor {
 
     constructor(
-        private readonly engine: Contract
+        private readonly engine: Contract,
+        /** Optional registry used to resolve DEX names → adapter addresses. */
+        private readonly registry?: any
     ) {}
 
     private async getDynamicGasPrice(provider: any): Promise<GasConfig> {
+        if (!provider?.getFeeData) {
+            console.warn("No provider available for gas pricing, using defaults");
+            return {
+                maxFeePerGas: ethers.parseUnits("2", "gwei"),
+                maxPriorityFeePerGas: ethers.parseUnits("1", "gwei")
+            };
+        }
         try {
             const feeData = await provider.getFeeData();
 
@@ -51,6 +140,60 @@ export class FlashLoanExecutor {
         }
     }
 
+    /** Resolve a DEX name to an adapter address via the optional registry. */
+    private resolveAdapter(adapterOrDex: string): string {
+        if (!this.registry) return adapterOrDex;
+        try {
+            // If the value is an address (0x…), use as-is; otherwise treat as DEX name.
+            return /^0x[a-fA-F0-9]{40}$/.test(adapterOrDex)
+                ? adapterOrDex
+                : this.registry.get(adapterOrDex);
+        } catch {
+            return adapterOrDex;
+        }
+    }
+
+    /** Map route.swaps: replace DEX names with adapter addresses when a registry is present. */
+    private resolveRoute(route: Route): Route {
+        return {
+            ...route,
+            swaps: route.swaps.map(s => ({ ...s, adapter: this.resolveAdapter(s.adapter) }))
+        };
+    }
+
+    /**
+     * High-level convenience: takes an opportunity object (modern `route` or legacy `steps`)
+     * and executes it. Returns a friendly result instead of throwing.
+     */
+    async executeFlashLoan(opp: any, token?: string): Promise<FlashLoanResult> {
+        try {
+            const route = normalizeRoute(opp);
+            if (route.swaps.length < 2) {
+                return { success: false, error: "Flash loan requires at least 2 cross-DEX swaps (arbitrage needs a round trip)." };
+            }
+            const resolved = this.resolveRoute(route);
+
+            const tokenIn = token || route.swaps[0].tokenIn;
+            const amountIn = route.swaps[0].amountIn;
+
+            const receipt = await this.execute(tokenIn, amountIn, resolved);
+            return {
+                success: true,
+                txHash: receipt.hash,
+                // Net profit is token-amount based; caller may refine USD value.
+                netProfitUSD: Number(route.minProfit || 0n) / 1e6
+            };
+        } catch (e: any) {
+            return { success: false, error: e?.message || String(e) };
+        }
+    }
+
+    /**
+     * Execute a flash-loan arbitrage.
+     * @param token  the token flashed (typically the profit token / asset)
+     * @param amount the flash amount in raw units
+     * @param route  the route object: { swaps: SwapStep[], profitToken, minProfit }
+     */
     async execute(
         token: string,
         amount: bigint,
@@ -71,7 +214,7 @@ export class FlashLoanExecutor {
             console.log("Max Fee Per Gas:", ethers.formatUnits(gasConfig.maxFeePerGas || 0n, "gwei"), "gwei");
             console.log("Max Priority Fee:", ethers.formatUnits(gasConfig.maxPriorityFeePerGas || 0n, "gwei"), "gwei");
 
-            // Estimate gas for the transaction
+            // Estimate gas for the transaction (non-fatal if estimation fails)
             let gasLimit: bigint;
             try {
                 gasLimit = await this.engine.executeArbitrage.estimateGas(

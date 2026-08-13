@@ -79,6 +79,10 @@ async function main() {
 
             deployment.contracts.uniswapAdapter,
 
+            deployment.contracts.sushiSwapAdapter || "",
+
+            deployment.contracts.pancakeSwapAdapter || "",
+
             deployment.contracts.aerodromeAdapter
 
         );
