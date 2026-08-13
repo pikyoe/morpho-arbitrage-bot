@@ -13,9 +13,9 @@ export interface PairCandidate {
     tokenB: string;
 }
 
-/** Estimate liquidity (USD) for a pool from optional fields; returns 0 when unknown. */
+/** Estimate liquidity (USD) for a pool from available fields; returns 0 when unknown. */
 function poolLiquidityUSD(pool: PoolInfo): number {
-    return pool.reserveUSD ?? 0;
+    return pool.reserveUSD ?? pool.totalValueLockedUSD ?? 0;
 }
 
 export function toUniquePairs(tokens: string[]): PairCandidate[] {
@@ -56,15 +56,30 @@ export function filterPairs(
     }
 
     const result: PairCandidate[] = [];
+    // Count distinct DEXes present in cache to detect incomplete data.
+    const loadedDexes = new Set(poolCache.getAll().map(p => p.dex.toLowerCase()));
+    const canVerifyDexVariety = loadedDexes.size >= minDexVariety;
+
+    // If cache cannot prove dex variety (not enough DEXes loaded), don't filter on it.
+    // The scan layer will still skip pairs with no quotes.
+    const shouldFilterDexVariety = canVerifyDexVariety;
+
     for (const pair of pairs) {
         const matches = poolCache.findPair(pair.tokenA, pair.tokenB);
-        if (matches.length === 0) continue;
 
-        const dexSet = new Set(matches.map(p => p.dex.toLowerCase()));
-        if (dexSet.size < minDexVariety) continue;
+        if (shouldFilterDexVariety) {
+            if (matches.length === 0) continue;
+            const dexSet = new Set(matches.map(p => p.dex.toLowerCase()));
+            if (dexSet.size < minDexVariety) continue;
+        } else {
+            // Data incomplete: accept the pair (scan decides).
+            // Still record for potential liquidity filtering below.
+        }
 
-        const underMinimum = matches.some(p => poolLiquidityUSD(p) < minLiquidityUSD);
-        if (underMinimum) continue;
+        // Liquidity filter: only reject pairs where EVERY matching pool is known below the threshold.
+        // Pools without reserveUSD are treated as unknown (allowed) since the RPC loader does not populate it.
+        const knownUnderMinimum = matches.every(p => poolLiquidityUSD(p) < minLiquidityUSD);
+        if (knownUnderMinimum) continue;
 
         result.push(pair);
         if (result.length >= maxPairsPerScan) break;

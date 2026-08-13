@@ -1,6 +1,9 @@
 export type DexType =
     | "UNISWAP"
-    | "AERODROME";
+    | "AERODROME"
+    | "PANCAKESWAP"
+    | "SUSHISWAP"
+    | "1INCH";
 
 export interface PoolInfo {
 
@@ -26,4 +29,9 @@ export interface PoolInfo {
 
     createdAtTimestamp?: number;
 
+    liquidity?: string; // Pool liquidity for debugging
+
+    sqrtPriceX96?: string; // Current price state
+
+    tick?: number; // Current tick
 }
