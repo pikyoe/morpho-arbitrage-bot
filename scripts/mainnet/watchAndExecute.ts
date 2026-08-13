@@ -40,6 +40,7 @@ const MIN_NET_PROFIT_USD = Number(process.env.MIN_NET_PROFIT_USD || 2);
 const POLL_INTERVAL_MS = Number(process.env.WATCH_POLL_MS || 5000); // 5s default
 const MAX_LOAN_USD = Number(process.env.WATCH_MAX_LOAN_USD || 10000);
 const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION !== "false"; // default true
+const SLIPPAGE_PCT = Math.min(Number(process.env.SLIPPAGE_PCT || 1.5), 1.5); // % tolerance, capped at 1.5%
 const VERBOSE = process.env.WATCH_VERBOSE === "true";
 const GENERAL_DEX_NAMES = ["UniswapV3", "SushiSwap", "PancakeSwap"];
 
@@ -205,9 +206,11 @@ function buildOpportunity(
         deadline: Math.floor(Date.now() / 1000) + 60
     });
 
+    // Apply slippage tolerance to each leg's minimum output (capped at 1.5%).
+    const slip = (out: bigint) => (out * (1000n - BigInt(Math.round(SLIPPAGE_PCT * 10)))) / 1000n;
     const steps = [
-        step(forward, amountIn, forward.amountOut),
-        step(reverse, forward.amountOut, reverse.amountOut)
+        step(forward, amountIn, slip(forward.amountOut)),
+        step(reverse, forward.amountOut, slip(reverse.amountOut))
     ];
 
     return {
@@ -230,7 +233,7 @@ async function main() {
     console.log("🚀 Spread Monitor + Auto-Execute");
     console.log("=================================");
     console.log(`Pair: ${WATCH_PAIR_A.slice(0,6)} ↔ ${WATCH_PAIR_B.slice(0,6)}`);
-    console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: $${TEST_AMOUNT_USD} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms`);
+    console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: $${TEST_AMOUNT_USD} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms | Slippage: ${SLIPPAGE_PCT}%`);
     console.log(`Execution: ${ENABLE_EXECUTION ? "ENABLED" : "DISABLED (watch only)"}`);
     console.log(`Signer: ${wallet.address}`);
     console.log();
