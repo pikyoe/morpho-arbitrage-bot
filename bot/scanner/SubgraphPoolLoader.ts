@@ -778,12 +778,12 @@ export class SubgraphPoolLoader {
         for (const triangle of triangles) {
             const [tokenA, tokenB, tokenC] = triangle;
             
-            // Check if triangle has liquidity on Aerodrome OR Uniswap (less strict)
+            // Check if triangle has liquidity on SushiSwap OR Uniswap (less strict)
             const hasSushiSwap = this.hasTriangleLiquidity(triangle, dexEdges.get("SUSHISWAP"));
             const hasUniswap = this.hasTriangleLiquidity(triangle, dexEdges.get("UNISWAP"));
             
             // Accept if it has liquidity on at least one DEX
-            if (hasAerodrome || hasUniswap) {
+            if (hasSushiSwap || hasUniswap) {
                 liquidTriangles.push(triangle);
             }
         }
@@ -804,7 +804,7 @@ export class SubgraphPoolLoader {
         const bc = dexEdges.get(tokenB)?.has(tokenC) || dexEdges.get(tokenC)?.has(tokenB);
         const ca = dexEdges.get(tokenC)?.has(tokenA) || dexEdges.get(tokenA)?.has(tokenC);
         
-        return ab && bc && ca;
+        return Boolean(ab && bc && ca);
     }
 
     /**
@@ -1129,7 +1129,7 @@ export class SubgraphPoolLoader {
 
             // Add DEX-specific bidirectional edges
             dexMap.get(token0.toLowerCase())!.add(token1.toLowerCase());
-            dexMap.get(token1.toLowerCase())!.add(token0.toLowerCase);
+            dexMap.get(token1.toLowerCase())!.add(token0.toLowerCase());
         }
 
         console.log(`Built graph: ${tokens.size} tokens, ${this.countEdges(edges)} edges`);
@@ -1362,7 +1362,7 @@ export class SubgraphPoolLoader {
         
         // Get DEX-specific edges (using normalized names) for fallback
         const uniswapEdges = dexEdges.get("UniswapV3");
-        const aerodromeEdges = dexEdges.get("Aerodrome");
+        const aerodromeEdges = dexEdges.get("Aerodrome") ?? new Map<string, Set<string>>();
         const pancakeswapEdges = dexEdges.get("PancakeSwap");
         
         if (!uniswapEdges) {
@@ -1663,7 +1663,7 @@ export class SubgraphPoolLoader {
 
         console.log("Generating cross-DEX arbitrage pairs...");
 
-        const aerodromeEdges = dexEdges.get("Aerodrome");
+        const aerodromeEdges = dexEdges.get("Aerodrome") ?? new Map<string, Set<string>>();
         const uniswapEdges = dexEdges.get("UniswapV3");
 
         if (!aerodromeEdges || !uniswapEdges) {

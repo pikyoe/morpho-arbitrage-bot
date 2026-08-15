@@ -1,6 +1,7 @@
 import { formatUnits } from "ethers";
 import { TOKEN_DECIMALS } from "../scanner/TokenList.js";
 import { convertUSDToTokenAmount, getTokenPriceUSD } from "../utils/USDAmountConverter.js";
+import { QuoteResult } from "../scanner/quote/index.js";
 
 export interface ExecutionSafetyInput {
     grossProfitUSD: number;
@@ -299,7 +300,7 @@ export interface OptimalAmountResult {
 
 export async function findOptimalAmount(
     route: any,
-    getQuote: (amount: bigint) => Promise<{ amountOut: bigint; dex: string }[]>,
+    getQuote: (amount: bigint) => Promise<QuoteResult[]>,
     getCost: (amount: bigint) => Promise<{ gasCostUSD: number; flashLoanFeeUSD: number }>,
     minAmountUSD: number = 100, // $100 USD
     maxAmountUSD: number = 10000, // $10,000 USD

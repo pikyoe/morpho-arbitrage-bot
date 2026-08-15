@@ -191,7 +191,6 @@ let provider: Provider;
 let signer: Wallet;
 let poolCache: PoolCache;
 let stateCache: PoolStateCache;
-let poolLoader: PoolLoader;
 let subgraphPoolLoader: SubgraphPoolLoader;
 let rpcPoolLoader: RpcPoolLoader;
 let uniStateLoader: UniswapPoolStateLoader;
@@ -303,14 +302,14 @@ async function main() {
     console.log("✅ Hybrid pool loaders initialized (Subgraph + RPC)");
 
     // Initialize state loaders
-    uniStateLoader = new UniswapPoolStateLoader(stateCache, provider);
-    aeroStateLoader = new AerodromePoolStateLoader(stateCache, provider);
+    uniStateLoader = new UniswapPoolStateLoader(provider, poolCache, stateCache);
+    aeroStateLoader = new AerodromePoolStateLoader(provider, poolCache, stateCache);
     poolStateLoader = new PoolStateLoader([uniStateLoader, aeroStateLoader]);
 
     // Initialize state scheduler if enabled
     if (!SKIP_POOL_STATE_REFRESH) {
-        scheduler = new PoolStateScheduler(poolStateLoader, 30000); // 30s refresh
-        await scheduler.start();
+        scheduler = new PoolStateScheduler(poolStateLoader, { intervalMs: 30000 }); // 30s refresh
+        scheduler.start();
         console.log("✅ Pool state scheduler started");
     }
 
@@ -477,7 +476,7 @@ async function main() {
     const discoveryQuoteEngine = new QuoteEngine(adaptedProviders);
     
     // Initialize triangular arbitrage scanner with DEX providers for discovery
-    triangularScanner = new TriangularArbitrageScanner(quoteEngine, poolCache, dexProviders, zeroXAggregator, provider, discoveryQuoteEngine);
+    triangularScanner = new TriangularArbitrageScanner(quoteEngine, poolCache, dexProviders, zeroXAggregator ?? undefined, provider, discoveryQuoteEngine);
 
     // Initialize discrepancy discovery engine for two-phase discovery
     let discrepancyEngine: DiscrepancyDiscoveryEngine | null = null;
@@ -526,7 +525,7 @@ async function main() {
             }
 
             // Build DEX edges for discovery engine
-            const dexEdges: Map<string, Map<string, string[]>> = new Map();
+            const dexEdges: Map<string, Map<string, Set<string>>> = new Map();
             for (const [tokenA, tokenMap] of tokenGraph) {
                 for (const [tokenB, dexes] of tokenMap) {
                     for (const dex of dexes) {
@@ -535,10 +534,10 @@ async function main() {
                         }
                         const dexMap = dexEdges.get(dex)!;
                         if (!dexMap.has(tokenA)) {
-                            dexMap.set(tokenA, []);
+                            dexMap.set(tokenA, new Set<string>());
                         }
-                        if (!dexMap.get(tokenA)!.includes(tokenB)) {
-                            dexMap.get(tokenA)!.push(tokenB);
+                        if (!dexMap.get(tokenA)!.has(tokenB)) {
+                            dexMap.get(tokenA)!.add(tokenB);
                         }
                     }
                 }
@@ -652,11 +651,23 @@ async function main() {
     if (ENABLE_EVENT_BASED_SCANNING && wsProvider) {
         blockEventScanner = new BlockEventScanner(
             provider,
-            poolCache,
-            poolStateLoader,
-            SCAN_INTERVAL_MS
+            scanner,
+            {
+                enabled: true,
+                skipBlocks: 0,
+                // Refresh pool state on each block so the polling loop always
+                // sees fresh quotes.
+                onBlock: async () => {
+                    try {
+                        await poolStateLoader.refresh();
+                    } catch (error) {
+                        console.log(`⚠️ Block-triggered pool state refresh failed: ${error instanceof Error ? error.message : error}`);
+                    }
+                }
+            }
         );
-        await blockEventScanner.start();
+        // start() requires a token pair; results are handled by onBlock above.
+        await blockEventScanner.start(TOKENS.USDC, TOKENS.WETH);
         console.log("✅ Block event scanner started");
     }
 
@@ -675,9 +686,10 @@ async function main() {
     // Circuit breaker configuration for mainnet safety
     const circuitBreakerConfig: CircuitBreakerConfig = {
         maxConsecutiveFailures: 3,           // Open after 3 consecutive failures
-        resetTimeoutMs: 300000,              // Reset after 5 minutes
-        maxFailureRate: 0.5,                 // Open if >50% failures in window
-        failureWindowMs: 600000               // 10 minute window
+        cooldownPeriod: 300000,              // 5 minutes before attempting to close
+        maxGasPriceGwei: 50,                 // Block if gas > 50 gwei
+        maxTxsPerMinute: 10,                 // Rate limit: 10 tx/min
+        minBalanceETH: 0.1                   // Minimum 0.1 ETH balance
     };
 
     circuitBreaker = new CircuitBreaker(circuitBreakerConfig);

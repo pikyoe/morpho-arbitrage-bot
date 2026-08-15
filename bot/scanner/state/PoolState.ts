@@ -40,6 +40,9 @@ export interface PoolState {
 
     reserve1?: bigint;
 
+    // Aerodrome V2 pools are either constant-product or stable pools.
+    stable?: boolean;
+
     //////////////////////////////////////////////////////
     // Shared
     //////////////////////////////////////////////////////

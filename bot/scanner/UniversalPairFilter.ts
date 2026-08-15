@@ -16,7 +16,7 @@ export interface PairCandidate {
 /** Estimate liquidity (USD); undefined means metadata is unavailable. */
 function poolLiquidityUSD(pool: PoolInfo): number | undefined {
     const values = [pool.reserveUSD, pool.totalValueLockedUSD]
-        .filter((value): value is number => Number.isFinite(value) && value > 0);
+        .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
     return values.length > 0 ? Math.max(...values) : undefined;
 }
 

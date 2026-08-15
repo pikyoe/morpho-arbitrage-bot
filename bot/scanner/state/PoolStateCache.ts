@@ -1,4 +1,4 @@
-import { PoolState } from "./PoolState";
+import { PoolState } from "./PoolState.js";
 
 export class PoolStateCache {
 
