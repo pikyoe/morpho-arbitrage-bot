@@ -23,6 +23,7 @@ import { FlashLoanExecutor } from "../../bot/executor/FlashLoanExecutor.js";
 import { TOKEN_DECIMALS, TOKENS } from "../../bot/scanner/TokenList.js";
 import { TIER_1_TOKENS, TIER_2_TOKENS } from "../../bot/scanner/TokenUniverse.js";
 import { toUniquePairs, batchPairs, filterPairs } from "../../bot/scanner/UniversalPairFilter.js";
+import { getTokenPriceUSD } from "../../bot/utils/USDAmountConverter.js";
 
 // Load .env.mainnet when no explicit environment file was supplied.
 if (!process.env.ENV_FILE) {
@@ -45,7 +46,11 @@ if (process.env.ENV_FILE) {
 const WATCH_PAIR_A = process.env.WATCH_TOKEN_A || TOKENS.WETH;
 const WATCH_PAIR_B = process.env.WATCH_TOKEN_B || TOKENS.AERO;
 // WATCH_MODE: "single" (default, pair A/B) | "all" (semua pair dari token universe) | "list" (pair dari WATCH_PAIRS)
-const WATCH_MODE = (process.env.WATCH_MODE || "all").toLowerCase();
+const WATCH_MODE_RAW = (process.env.WATCH_MODE || "all").toLowerCase();
+if (WATCH_MODE_RAW !== "single" && WATCH_MODE_RAW !== "all" && WATCH_MODE_RAW !== "list") {
+    throw new Error(`Invalid WATCH_MODE "${WATCH_MODE_RAW}" — expected "single", "all", or "list"`);
+}
+const WATCH_MODE: "single" | "all" | "list" = WATCH_MODE_RAW;
 const WATCH_PAIRS_CSV = process.env.WATCH_PAIRS || ""; // e.g. "0xAAA,0xBBB;0xCCC,0xDDD"
 const WATCH_TOP_TOKENS = Number(process.env.WATCH_TOP_TOKENS || 0); // 0 = all tokens in the universe
 const SCAN_BATCH_SIZE = Number(process.env.SCAN_BATCH_SIZE || 8);
@@ -304,6 +309,26 @@ function resolveScanPairs(): { tokenA: string; tokenB: string }[] {
     return [{ tokenA: WATCH_PAIR_A, tokenB: WATCH_PAIR_B }];
 }
 
+/** Why a candidate pair was dropped by filterPairs (mirrors its rejection order). */
+function pairRejectReason(pair: { tokenA: string; tokenB: string }): string {
+    const matches = poolCache.findPair(pair.tokenA, pair.tokenB);
+    const loadedDexes = new Set(poolCache.getAll().map(p => p.dex.toLowerCase()));
+    const canVerifyVariety = loadedDexes.size >= MIN_DEX_VARIETY;
+
+    if (canVerifyVariety && matches.length === 0) {
+        return "no pools in cache for this pair (subgraph/RPC did not load it)";
+    }
+    if (canVerifyVariety && new Set(matches.map(p => p.dex.toLowerCase())).size < MIN_DEX_VARIETY) {
+        const dexes = [...new Set(matches.map(pool => pool.dex))].join(",") || "none";
+        return `dex variety: ${dexes} < required ${MIN_DEX_VARIETY}`;
+    }
+    const liquidity = matches
+        .flatMap(pool => [pool.reserveUSD, pool.totalValueLockedUSD])
+        .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+    const maxLiquidity = liquidity.length > 0 ? Math.max(...liquidity) : 0;
+    return `liquidity $${maxLiquidity.toFixed(2)} < required $${MIN_LIQUIDITY_USD}`;
+}
+
 /** Quote all pairs in bounded batches; returns only top{N} candidates by net USD. */
 async function scanAllPairs(
     pairs: { tokenA: string; tokenB: string }[],
@@ -317,22 +342,24 @@ async function scanAllPairs(
         maxPairsPerScan: MAX_PAIRS_PER_SCAN,
         poolCache
     });
+    const accepted = new Set(filtered.map(pair => `${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`));
+    const dropped = pairs.filter(pair => !accepted.has(`${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`));
     console.log(`[SCAN] configured=${pairs.length}, eligible=${filtered.length}, mode=${WATCH_MODE}`);
     if (filtered.length === 0) {
         console.log("[SCAN] No pairs passed liquidity/DEX filter; waiting for pool refresh");
     }
-    if (VERBOSE) {
-        const accepted = new Set(filtered.map(pair => `${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`));
-        for (const pair of pairs) {
-            const key = `${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`;
-            if (accepted.has(key)) continue;
-            const matches = poolCache.findPair(pair.tokenA, pair.tokenB);
-            const dexes = [...new Set(matches.map(pool => pool.dex))].join(",") || "none";
-            const liquidity = matches
-                .flatMap(pool => [pool.reserveUSD, pool.totalValueLockedUSD])
-                .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-            const maxLiquidity = liquidity.length > 0 ? Math.max(...liquidity) : 0;
-            console.log(`[FILTER] ${pair.tokenA.slice(0, 8)}↔${pair.tokenB.slice(0, 8)} rejected: pools=${matches.length}, dexes=${dexes}, maxLiquidity=$${maxLiquidity.toFixed(2)}, requiredDexes=${MIN_DEX_VARIETY}, requiredLiquidity=$${MIN_LIQUIDITY_USD}`);
+    // Always surface dropped pairs (with reasons) so a silently filtered pair is
+    // visible without WATCH_VERBOSE. Per-pair detail is capped to avoid log spam
+    // on large universes.
+    const MAX_REJECT_LOG = 20;
+    if (dropped.length > 0) {
+        const showAll = VERBOSE || dropped.length <= MAX_REJECT_LOG;
+        const shown = showAll ? dropped : dropped.slice(0, MAX_REJECT_LOG);
+        for (const pair of shown) {
+            console.log(`[FILTER] ${pair.tokenA.slice(0, 8)}↔${pair.tokenB.slice(0, 8)} rejected: ${pairRejectReason(pair)}`);
+        }
+        if (!showAll) {
+            console.log(`[FILTER] … and ${dropped.length - MAX_REJECT_LOG} more dropped pairs (set WATCH_VERBOSE=true for the full list)`);
         }
     }
     if (VERBOSE && filtered.length !== pairs.length) {
@@ -427,14 +454,14 @@ async function scanAllPairs(
  *  Steps are built as SwapStep tuples matching ArbitrageEngineV2's route struct:
  *  (adapter, tokenIn, tokenOut, fee, amountIn, minAmountOut, data, deadline)
  */
-function buildOpportunity(
+async function buildOpportunity(
     forward: QuoteResult,
     reverse: QuoteResult,
     tokenIn: string,
     amountIn: bigint,
     profit: bigint,
     adapterRegistry: AdapterRegistry
-): any {
+): Promise<any> {
     const step = (q: QuoteResult, amountInRaw: bigint, minOut: bigint) => ({
         adapter: adapterRegistry.get(q.dex),
         tokenIn: q.tokenIn,
@@ -459,6 +486,15 @@ function buildOpportunity(
         step(reverse, 0n, slip(reverse.amountOut))
     ];
 
+    // Net profit in USD: raw profit → token units → USD. Use the
+    // USDAmountConverter price table, falling back to a live quote when the
+    // converter has no entry for the profit token.
+    let tokenPriceUSD = getTokenPriceUSD(tokenIn);
+    if (!Number.isFinite(tokenPriceUSD) || tokenPriceUSD <= 0) {
+        tokenPriceUSD = await tokenUsdPrice(tokenIn);
+    }
+    const netProfitUSD = Number(formatUnits(profit, getDecimals(tokenIn))) * tokenPriceUSD;
+
     return {
         route: {
             swaps: steps,
@@ -468,7 +504,7 @@ function buildOpportunity(
         inputAmount: amountIn,
         outputAmount: amountIn + profit,
         profit,
-        netProfitUSD: Number(profit) / (10 ** getDecimals(tokenIn))
+        netProfitUSD
     };
 }
 
@@ -529,7 +565,7 @@ async function main() {
     }
 
     // Amount for monitoring (in token A units) — kept for single mode
-    let amountInSingle: bigint;
+    let amountInSingle: bigint | undefined;
 
     // Preload pool cache from subgraphs (lightweight GraphQL; avoids RPC rate limits) — enables MIN_DEX_VARIETY/MIN_LIQUIDITY filters.
     const SUBGRAPH_POOL_LIMIT_N = Number(process.env.SUBGRAPH_POOL_LIMIT || 20);
@@ -706,7 +742,7 @@ async function main() {
                 continue;
             }
 
-            const opp = buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
+            const opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
             try {
                 const ok = await engineContract!.validateRoute(opp.route, tokenA);
                 if (!ok) {
@@ -737,6 +773,11 @@ async function main() {
         }
 
         // -------- Single-pair mode (default) --------
+        // Safety net: single mode computes the test amount at startup, but
+        // recompute lazily so the loop can never read an unassigned value.
+        if (amountInSingle === undefined) {
+            amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
+        }
         const amountIn = amountInSingle;
         // Quote token A -> token B (buy) on every DEX
         const buyQuotes: { dex: string; q: QuoteResult }[] = [];
@@ -824,7 +865,7 @@ async function main() {
 
         // Build opportunity & execute
         const profit = reverse.amountOut - amountIn;
-        const opp = buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
+        const opp = await buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
 
         // Validate route on-chain before spending gas (non-fatal if it fails)
         try {
