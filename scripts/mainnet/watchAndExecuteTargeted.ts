@@ -34,10 +34,16 @@ process.env.WATCH_TEST_USD ||= "500";
 process.env.WATCH_POLL_MS ||= "5000";
 process.env.MIN_DEX_VARIETY ||= "2";
 
-// Keep startup RPC usage low. Set TARGETED_ALLOW_RPC_POOL_DISCOVERY=true if
-// you explicitly want factory-based pool discovery for missing subgraph data.
-if (process.env.TARGETED_ALLOW_RPC_POOL_DISCOVERY !== "true") {
-    process.env.POOL_RPC_FALLBACK = "false";
+// Keep startup RPC usage low unless the user explicitly opts in.
+// TARGETED_ALLOW_RPC_POOL_DISCOVERY=true enables factory RPC discovery for the
+// requested pairs. An explicit POOL_RPC_FALLBACK setting is always respected
+// (and logged), never silently overridden.
+if (process.env.TARGETED_ALLOW_RPC_POOL_DISCOVERY === "true") {
+    console.log("🔧 TARGETED_ALLOW_RPC_POOL_DISCOVERY=true — factory RPC pool discovery enabled");
+} else if (process.env.POOL_RPC_FALLBACK === undefined) {
+    process.env.POOL_RPC_FALLBACK = "false"; // subgraph-only by default
+} else {
+    console.warn(`⚠️ TARGETED_ALLOW_RPC_POOL_DISCOVERY is not "true" but POOL_RPC_FALLBACK=${process.env.POOL_RPC_FALLBACK} was set explicitly — respecting it`);
 }
 
 // Fail closed: execution must be explicitly enabled in the env file.
