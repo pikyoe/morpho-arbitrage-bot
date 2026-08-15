@@ -328,11 +328,20 @@ function pairRejectReason(pair: { tokenA: string; tokenB: string }): string {
         const dexes = [...new Set(matches.map(pool => pool.dex))].join(",") || "none";
         return `dex variety: ${dexes} < required ${MIN_DEX_VARIETY}`;
     }
-    const liquidity = matches
-        .flatMap(pool => [pool.reserveUSD, pool.totalValueLockedUSD])
-        .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-    const maxLiquidity = liquidity.length > 0 ? Math.max(...liquidity) : 0;
-    return `liquidity $${maxLiquidity.toFixed(2)} < required $${MIN_LIQUIDITY_USD}`;
+    // Mirror filterPairs' liquidity rule exactly: reject only when EVERY
+    // matching pool has a known liquidity value below the threshold. Unknown
+    // RPC liquidity is not zero liquidity.
+    const knownValues = matches.map(pool => {
+        const values = [pool.reserveUSD, pool.totalValueLockedUSD]
+            .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+        return values.length > 0 ? Math.max(...values) : undefined;
+    });
+    const allKnown = knownValues.length > 0 && knownValues.every(value => value !== undefined);
+    if (allKnown && knownValues.every(value => (value as number) < MIN_LIQUIDITY_USD)) {
+        return `liquidity $${Math.max(...(knownValues as number[])).toFixed(2)} < required $${MIN_LIQUIDITY_USD}`;
+    }
+    // Passed every check — the only way filterPairs dropped it is the cap.
+    return `capped by MAX_PAIRS_PER_SCAN=${MAX_PAIRS_PER_SCAN} (pair passed liquidity/dex checks)`;
 }
 
 /** Quote all pairs in bounded batches; returns only top{N} candidates by net USD. */
