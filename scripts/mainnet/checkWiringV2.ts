@@ -12,6 +12,8 @@ async function main() {
   const engineAddress = process.env.ARBITRAGE_ENGINE_V2_ADDRESS;
   const morphoAddress = process.env.MORPHO_FLASHLOAN_V2_ADDRESS;
   const uniswapAdapterAddress = process.env.UNISWAP_ADAPTER_V2_ADDRESS;
+  const sushiSwapAdapterAddress = process.env.SUSHISWAP_ADAPTER_V2_ADDRESS;
+  const pancakeSwapAdapterAddress = process.env.PANCAKESWAP_ADAPTER_V2_ADDRESS;
   const aerodromeAdapterAddress = process.env.AERODROME_ADAPTER_V2_ADDRESS;
 
   if (!engineAddress || !morphoAddress) {
@@ -35,20 +37,34 @@ async function main() {
     throw new Error("Invalid AERODROME_ADAPTER_V2_ADDRESS");
   }
 
+  if (sushiSwapAdapterAddress && !ethers.isAddress(sushiSwapAdapterAddress)) {
+    throw new Error("Invalid SUSHISWAP_ADAPTER_V2_ADDRESS");
+  }
+
+  if (pancakeSwapAdapterAddress && !ethers.isAddress(pancakeSwapAdapterAddress)) {
+    throw new Error("Invalid PANCAKESWAP_ADAPTER_V2_ADDRESS");
+  }
+
   const [signer] = await ethers.getSigners();
+  const actualNetwork = await ethers.provider.getNetwork();
+  if (actualNetwork.chainId !== 8453n) {
+    throw new Error(`Wrong network: expected Base mainnet (8453), got ${actualNetwork.chainId}`);
+  }
 
   console.log("==============================");
   console.log("Checking Wiring");
   console.log("==============================");
-  const networkName = ((hre.network as any).name ?? "unknown") as string;
-  const chainId = ((hre.network as any).config?.chainId ?? "unknown") as string;
-  console.log("Network :", networkName);
+  console.log("Network : Base mainnet");
   console.log("Signer  :", signer.address);
-  console.log("chainId :", chainId);
+  console.log("chainId :", actualNetwork.chainId.toString());
   console.log();
 
   const engine = await ethers.getContractAt("ArbitrageEngineV2", engineAddress);
   const morpho = await ethers.getContractAt("MorphoFlashLoanV2", morphoAddress);
+
+  if (!(await engine.authorizedCaller(signer.address)) && signer.address.toLowerCase() !== (await engine.owner()).toLowerCase()) {
+    throw new Error(`Signer ${signer.address} is not authorized to execute on the engine`);
+  }
 
   // Two-way wiring verification
   const engineMorpho = await engine.morphoFlashLoan();
@@ -64,6 +80,37 @@ async function main() {
   }
   if (aerodromeAdapterAddress) {
     console.log("Engine -> Aerodrome adapter:", aerodromeAdapterAddress);
+  }
+
+  for (const [name, address] of [
+    ["SushiSwap", sushiSwapAdapterAddress],
+    ["PancakeSwap", pancakeSwapAdapterAddress]
+  ] as const) {
+    if (!address) continue;
+    const adapter: any = await ethers.getContractAt("UniswapV3AdapterV2", address);
+    const adapterEngine = await adapter.engine();
+    console.log(`${name} adapter -> Engine:`, adapterEngine);
+    if (adapterEngine.toLowerCase() !== engineAddress.toLowerCase()) {
+      throw new Error(`${name} adapter wired incorrectly`);
+    }
+  }
+
+  // Verify immutable router addresses used by each adapter.
+  const routerChecks = [
+    ["Uniswap", uniswapAdapterAddress, process.env.UNISWAP_ROUTER_ADDRESS],
+    ["SushiSwap", sushiSwapAdapterAddress, process.env.SUSHISWAP_ROUTER],
+    ["PancakeSwap", pancakeSwapAdapterAddress, process.env.PANCAKESWAP_ROUTER_ADDRESS],
+    ["Aerodrome", aerodromeAdapterAddress, process.env.AERODROME_ROUTER_ADDRESS]
+  ] as const;
+  for (const [name, address, expectedRouter] of routerChecks) {
+    if (!address || !expectedRouter) continue;
+    const abiName = name === "Aerodrome" ? "AerodromeAdapterV2" : "UniswapV3AdapterV2";
+    const adapter: any = await ethers.getContractAt(abiName, address);
+    const actualRouter = await adapter.router();
+    console.log(`${name} adapter router:`, actualRouter);
+    if (actualRouter.toLowerCase() !== expectedRouter.toLowerCase()) {
+      throw new Error(`${name} adapter router mismatch`);
+    }
   }
 
   console.log("====================");
@@ -99,6 +146,16 @@ async function main() {
     if (aeroEngine.toLowerCase() !== engineAddress.toLowerCase()) {
       throw new Error("Aerodrome adapter wired incorrectly");
     }
+  }
+
+  for (const [name, address] of [
+    ["SushiSwap", sushiSwapAdapterAddress],
+    ["PancakeSwap", pancakeSwapAdapterAddress]
+  ] as const) {
+    if (!address) continue;
+    const approved = await engine.approvedAdapter(address);
+    console.log(`${name}:`, approved);
+    if (!approved) console.warn(`${name} adapter not approved`);
   }
 
   console.log("====================");

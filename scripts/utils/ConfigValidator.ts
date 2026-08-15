@@ -36,11 +36,19 @@ export class ConfigValidator {
             'AERO_ADDRESS',
             'CBBTC_ADDRESS',
             'CBETH_ADDRESS',
+            'USDE_ADDRESS',
+            'RLUSD_ADDRESS',
+            'MORPHO_TOKEN_ADDRESS',
             'BASE_RPC_URL_1',
             'BASE_RPC_URL_2',
             'UNISWAP_SUBGRAPH_URL',
             'AERODROME_SUBGRAPH_URL',
-            'SUBGRAPH_POOL_LIMIT'
+            'SUBGRAPH_POOL_LIMIT',
+            'INCH_API_KEY',
+            'INCH_API_BASE_URL',
+            'PANCAKESWAP_FACTORY_ADDRESS',
+            'PANCAKESWAP_QUOTER_ADDRESS',
+            'PANCAKESWAP_ROUTER_ADDRESS'
         ],
         addressFields: [
             'MORPHO_ADDRESS',
@@ -58,7 +66,13 @@ export class ConfigValidator {
             'SAMPLE_AUTHORIZED_ADDRESS',
             'AERO_ADDRESS',
             'CBBTC_ADDRESS',
-            'CBETH_ADDRESS'
+            'CBETH_ADDRESS',
+            'USDE_ADDRESS',
+            'RLUSD_ADDRESS',
+            'MORPHO_TOKEN_ADDRESS',
+            'PANCAKESWAP_FACTORY_ADDRESS',
+            'PANCAKESWAP_QUOTER_ADDRESS',
+            'PANCAKESWAP_ROUTER_ADDRESS'
         ],
         urlFields: [
             'BASE_RPC_URL',
