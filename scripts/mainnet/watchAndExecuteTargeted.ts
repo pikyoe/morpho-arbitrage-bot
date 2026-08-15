@@ -7,13 +7,15 @@
  */
 import * as dotenv from "dotenv";
 
-// Load the requested environment before importing the watcher. Loading
-// .env first would prevent .env.mainnet values from taking effect.
-const envPath = process.env.ENV_FILE || ".env";
+// Load the requested environment before importing the watcher. Defaults to
+// .env.mainnet so a stale root .env can never shadow the production config.
+const envPath = process.env.ENV_FILE || ".env.mainnet";
 const envResult = dotenv.config({ path: envPath });
 if (envResult.error && process.env.ENV_FILE) {
     throw new Error(`Failed to load environment file ${envPath}: ${envResult.error.message}`);
 }
+// Let the underlying watcher reload/log the same file instead of a default .env.
+process.env.ENV_FILE ||= envPath;
 
 const { TOKENS } = await import("../../bot/scanner/TokenList.js");
 

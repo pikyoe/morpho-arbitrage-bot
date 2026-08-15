@@ -24,9 +24,9 @@ import { TOKEN_DECIMALS, TOKENS } from "../../bot/scanner/TokenList.js";
 import { TIER_1_TOKENS, TIER_2_TOKENS } from "../../bot/scanner/TokenUniverse.js";
 import { toUniquePairs, batchPairs, filterPairs } from "../../bot/scanner/UniversalPairFilter.js";
 
-// Load .env when no explicit environment file was supplied.
+// Load .env.mainnet when no explicit environment file was supplied.
 if (!process.env.ENV_FILE) {
-    dotenv.config({ path: ".env" });
+    dotenv.config({ path: ".env.mainnet" });
 }
 
 // Load explicit environment file before reading configuration constants.
