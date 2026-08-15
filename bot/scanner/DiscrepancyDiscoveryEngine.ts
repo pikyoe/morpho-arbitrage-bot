@@ -1,4 +1,5 @@
 import { DexQuoteProvider } from "./quote/DexQuoteProvider.js";
+import { QuoteResult } from "./quote/index.js";
 import { PoolCache } from "./PoolCache.js";
 import { Contract, formatUnits, parseUnits, Provider } from "ethers";
 import { TOKEN_DECIMALS } from "./TokenList.js";
@@ -195,7 +196,7 @@ export class DiscrepancyDiscoveryEngine {
                 const quotes = await Promise.all(this.dexProviders.map(provider =>
                     provider.quote({ tokenIn: tokenAddress, tokenOut: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDA02913", amountIn: oneToken })
                 ));
-                const valid = quotes.filter(q => q && q.amountOut > 0n);
+                const valid = quotes.filter((q): q is QuoteResult => q !== null && q.amountOut > 0n);
                 if (valid.length > 0) {
                     const best = valid.reduce((a, b) => a.amountOut > b.amountOut ? a : b);
                     tokenPriceUSD = Number(formatUnits(best.amountOut, 6));
@@ -365,7 +366,7 @@ export class DiscrepancyDiscoveryEngine {
                                     normalizedPrice,
                                     dex: provider.getDexName(),
                                     pool: quote.pool,
-                                    fee: quote.fee,
+                                    fee: quote.fee ?? 0,
                                     stable: quote.stable,
                                     factory: quote.factory,
                                     dexProvider: provider
@@ -377,7 +378,7 @@ export class DiscrepancyDiscoveryEngine {
                                     tokenIn: quote.tokenIn,
                                     tokenOut: quote.tokenOut,
                                     pool: quote.pool,
-                                    fee: quote.fee,
+                                    fee: quote.fee ?? 0,
                                     stable: quote.stable,
                                     factory: quote.factory,
                                     amountIn: quote.amountIn,

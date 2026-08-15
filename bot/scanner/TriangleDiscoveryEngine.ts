@@ -268,12 +268,13 @@ export class TriangleDiscoveryEngine {
         
         console.log(`    ✅ DEX variety check passed: ${dexVariety} different DEX${dexVariety > 1 ? 's' : ''}`);
 
-        // 2. Minimum liquidity per leg
+        // 2. Minimum liquidity per leg (skip legs with unknown liquidity)
         for (const quote of [quoteAB, quoteBC, quoteCA]) {
             const pool = this.poolCache.get(quote.pool);
             if (!pool) continue;
             
             const liquidityUSD = pool.reserveUSD;
+            if (liquidityUSD === undefined) continue;
             console.log(`    Liquidity check: pool=${quote.pool.slice(0,8)} liquidity=$${liquidityUSD.toLocaleString()}`);
             if (liquidityUSD < this.minLiquidityPerLeg) {
                 console.log(`    ❌ Filtered: Low liquidity leg ($${liquidityUSD.toLocaleString()} < $${this.minLiquidityPerLeg.toLocaleString()})`);
@@ -296,6 +297,7 @@ export class TriangleDiscoveryEngine {
             if (!pool) continue;
             
             const liquidityUSD = pool.reserveUSD;
+            if (liquidityUSD === undefined) continue;
             const ratio = inputUSD / liquidityUSD;
             console.log(`    Ratio check: pool=${quote.pool.slice(0,8)} ratio=${(ratio * 100).toFixed(2)}%`);
             
@@ -323,7 +325,7 @@ export class TriangleDiscoveryEngine {
         
         for (const quote of [quoteAB, quoteBC, quoteCA]) {
             const pool = this.poolCache.get(quote.pool);
-            if (pool) {
+            if (pool && pool.reserveUSD !== undefined) {
                 minLiquidity = Math.min(minLiquidity, pool.reserveUSD);
                 const ratio = inputUSD / pool.reserveUSD;
                 maxInputLiquidityRatio = Math.max(maxInputLiquidityRatio, ratio);

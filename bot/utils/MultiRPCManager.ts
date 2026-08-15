@@ -67,7 +67,7 @@ let multiRPCManager: MultiRPCManager | null = null;
 
 export function getMultiRPCManager(): MultiRPCManager {
     if (!multiRPCManager) {
-        const rpc1 = process.env.BASE_RPC_URL_1 || process.env.BASE_RPC_URL;
+        const rpc1 = process.env.BASE_RPC_URL_1 || process.env.BASE_RPC_URL || "";
         const rpc2 = process.env.BASE_RPC_URL_2 || "";
         
         if (rpc2) {

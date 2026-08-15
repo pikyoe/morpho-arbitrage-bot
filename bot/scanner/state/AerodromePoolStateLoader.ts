@@ -2,7 +2,7 @@ import { Contract, Provider } from "ethers";
 
 import { PoolCache } from "../PoolCache.js";
 import { PoolStateCache } from "./PoolStateCache.js";
-import { PoolInfo } from "../PoolCache.js";
+import { PoolInfo } from "../PoolTypes.js";
 import { IPoolStateLoader } from "./IPoolStateLoader.js";
 
 import { AERODROME_POOL_ABI } from "../abis/AerodromePool.js";
@@ -143,9 +143,9 @@ export class AerodromePoolStateLoader
 
                 stable: pool.stable ?? false,
 
-                blockNumber,
+                blockNumber: BigInt(blockNumber),
 
-                updatedAt: Date.now()
+                timestamp: Date.now()
 
             });
 

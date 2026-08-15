@@ -47,10 +47,11 @@ export class HybridAggregator {
         }
 
         // Try 1inch as fallback (in parallel)
-        if (this.oneInch.isEnabled()) {
+        const oneInch = this.oneInch;
+        if (oneInch && oneInch.isEnabled()) {
             const oneInchStart = Date.now();
             try {
-                const oneInchQuote = await this.oneInch.getQuote(request);
+                const oneInchQuote = await oneInch.getQuote(request);
                 results.push({
                     aggregator: "1inch",
                     quote: oneInchQuote,
@@ -97,8 +98,9 @@ export class HybridAggregator {
      * Get quote from fallback aggregator only (1inch)
      */
     public async getFallbackQuote(request: QuoteRequest): Promise<QuoteResult | null> {
-        if (this.oneInch.isEnabled()) {
-            return await this.oneInch.getQuote(request);
+        const oneInch = this.oneInch;
+        if (oneInch && oneInch.isEnabled()) {
+            return await oneInch.getQuote(request);
         }
         return null;
     }
@@ -112,7 +114,7 @@ export class HybridAggregator {
         slippage: number = 1,
         preferredAggregator?: string
     ): Promise<any | null> {
-        if (preferredAggregator === "1inch" || preferredAggregator === "1INCH") {
+        if (this.oneInch && (preferredAggregator === "1inch" || preferredAggregator === "1INCH")) {
             return await this.oneInch.getSwapData(request, fromAddress, slippage);
         }
         
@@ -126,7 +128,7 @@ export class HybridAggregator {
     public async checkHealth(): Promise<{ zeroX: boolean; oneInch: boolean }> {
         const [zeroXHealth, oneInchHealth] = await Promise.all([
             this.zeroX.checkHealth(),
-            this.oneInch.checkHealth()
+            this.oneInch ? this.oneInch.checkHealth() : Promise.resolve(false)
         ]);
 
         return {
@@ -155,7 +157,7 @@ export class HybridAggregator {
     public getStats(): { zeroXEnabled: boolean; oneInchEnabled: boolean } {
         return {
             zeroXEnabled: this.zeroX.isEnabled(),
-            oneInchEnabled: this.oneInch.isEnabled()
+            oneInchEnabled: this.oneInch?.isEnabled() ?? false
         };
     }
 }

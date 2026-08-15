@@ -417,8 +417,8 @@ export class TriangularArbitrageScanner {
                         return { gasCostUSD, flashLoanFeeUSD };
                     }
                 },
-                minAmount,
-                maxAmount,
+                Number(minAmount) / 1e6,
+                Number(maxAmount) / 1e6,
                 6 // Test 6 amounts: 100, 500, 1k, 2k, 5k, 10k
             );
             

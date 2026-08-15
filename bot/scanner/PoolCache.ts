@@ -45,6 +45,15 @@ export class PoolCache {
 
     }
 
+    get(
+        poolAddress: string
+    ): PoolInfo | undefined {
+
+        const key = poolAddress.toLowerCase();
+        return this.pools.find(pool => pool.pool.toLowerCase() === key);
+
+    }
+
     findPair(
         tokenA: string,
         tokenB: string
