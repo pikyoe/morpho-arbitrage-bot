@@ -19,6 +19,14 @@ secrets/
 *.tmp
 tmp-*
 debugsel.*
+sel.mjs
+trace.json
+
+# Build output
+dist/
+
+# Local tooling / agent config
+.claude/
 # OS files
 .DS_Store
 Thumbs.db
