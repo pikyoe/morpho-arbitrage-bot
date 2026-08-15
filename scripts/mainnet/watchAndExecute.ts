@@ -79,7 +79,22 @@ const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.1), 
 const MIN_PROFIT_BUFFER_PCT = Math.min(Math.max(Number(process.env.MIN_PROFIT_BUFFER_PCT || 50), 10), 90);
 const VERBOSE = process.env.WATCH_VERBOSE === "true";
 const GENERAL_DEX_NAMES = ["UniswapV3", "SushiSwap", "PancakeSwap"];
-const EFFECTIVE_TEST_AMOUNT_USD = Math.min(TEST_AMOUNT_USD, MAX_LOAN_USD);
+// Test-size ladder: start at WATCH_TEST_USD_START, ramp by WATCH_TEST_USD_STEP
+// every WATCH_TEST_USD_RAMP_LOOPS scan loops up to WATCH_TEST_USD (the max),
+// then cycle back to the start. Thin pools are probed at small sizes (sane
+// quotes) while larger sizes capture bigger absolute profits on the same
+// spread. Without WATCH_TEST_USD_START the amount stays fixed at WATCH_TEST_USD.
+const TEST_AMOUNT_USD_MAX = Math.min(TEST_AMOUNT_USD, MAX_LOAN_USD);
+const TEST_AMOUNT_USD_START = Math.min(
+    Math.max(1, Number(process.env.WATCH_TEST_USD_START ?? TEST_AMOUNT_USD_MAX)),
+    TEST_AMOUNT_USD_MAX
+);
+const TEST_AMOUNT_USD_STEP = Math.max(
+    1,
+    Number(process.env.WATCH_TEST_USD_STEP ?? Math.max(100, Math.floor((TEST_AMOUNT_USD_MAX - TEST_AMOUNT_USD_START) / 10)))
+);
+const TEST_AMOUNT_RAMP_LOOPS = Math.max(1, Number(process.env.WATCH_TEST_USD_RAMP_LOOPS ?? 1));
+let currentTestAmountUSD = TEST_AMOUNT_USD_START;
 
 if (!Number.isFinite(TEST_AMOUNT_USD) || TEST_AMOUNT_USD <= 0) {
     throw new Error("WATCH_TEST_USD must be a positive number");
@@ -87,7 +102,6 @@ if (!Number.isFinite(TEST_AMOUNT_USD) || TEST_AMOUNT_USD <= 0) {
 if (!Number.isFinite(MAX_LOAN_USD) || MAX_LOAN_USD <= 0) {
     throw new Error("WATCH_MAX_LOAN_USD must be a positive number");
 }
-const QUOTE_AMOUNT_USD = Math.min(TEST_AMOUNT_USD, MAX_LOAN_USD);
 
 // ------------------------------------------------------------------
 // ABI fragments shared with the engine (ArbitrageEngineV2)
@@ -606,7 +620,10 @@ async function main() {
     } else {
         console.log(`Pair: ${WATCH_PAIR_A.slice(0,6)} ↔ ${WATCH_PAIR_B.slice(0,6)}`);
     }
-    console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: $${TEST_AMOUNT_USD} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms | Slippage: ${SLIPPAGE_PCT}%`);
+    const testSizeLabel = TEST_AMOUNT_USD_START < TEST_AMOUNT_USD_MAX
+        ? `$${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX} (ladder +$${TEST_AMOUNT_USD_STEP}/loop)`
+        : `$${TEST_AMOUNT_USD}`;
+    console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: ${testSizeLabel} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms | Slippage: ${SLIPPAGE_PCT}%`);
     console.log(`Execution: ${ENABLE_EXECUTION ? "ENABLED" : "DISABLED (watch only)"}`);
     console.log(`Signer: ${wallet ? wallet.address : "n/a (watch-only, no PRIVATE_KEY)"}`);
     console.log();
@@ -787,8 +804,8 @@ async function main() {
     console.log();
     if (WATCH_MODE === "single") {
         try {
-            amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
-            console.log(`Single-pair monitoring amount: ${await formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${EFFECTIVE_TEST_AMOUNT_USD})\n`);
+            amountInSingle = await usdToTokenAmount(currentTestAmountUSD, WATCH_PAIR_A);
+            console.log(`Single-pair monitoring amount: ${await formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${currentTestAmountUSD})\n`);
         } catch (e: any) {
             console.error(`❌ Cannot size the monitoring amount for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}).`);
             console.error("   USD pricing needs UNISWAP_QUOTER_ADDRESS/UNISWAP_FACTORY_ADDRESS (or use WATCH_MODE=list). Exiting.");
@@ -806,13 +823,22 @@ async function main() {
         loop++;
         const startTime = Date.now();
 
+        // Advance the test-size ladder (cycle back to the start at the top).
+        if (loop > 1 && (loop - 1) % TEST_AMOUNT_RAMP_LOOPS === 0) {
+            currentTestAmountUSD += TEST_AMOUNT_USD_STEP;
+            if (currentTestAmountUSD > TEST_AMOUNT_USD_MAX) {
+                currentTestAmountUSD = TEST_AMOUNT_USD_START;
+            }
+            console.log(`  💰 Test size: $${currentTestAmountUSD} (ladder $${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX})`);
+        }
+
         // Build per-token amount lazily (only for pairs actually scanned)
         const amountCache = new Map<string, bigint>();
         const amountFor = async (token: string): Promise<bigint> => {
             const key = token.toLowerCase();
             const cached = amountCache.get(key);
             if (cached) return cached;
-            const v = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, token);
+            const v = await usdToTokenAmount(currentTestAmountUSD, token);
             amountCache.set(key, v);
             return v;
         };
@@ -903,7 +929,7 @@ async function main() {
         // of crashing the watcher.
         if (amountInSingle === undefined) {
             try {
-                amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
+                amountInSingle = await usdToTokenAmount(currentTestAmountUSD, WATCH_PAIR_A);
             } catch (e: any) {
                 console.log(`  ⚠️ Cannot size amount for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}) — skipping loop`);
                 await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
