@@ -108,8 +108,8 @@ if (RPC_URLS.length === 0) {
     throw new Error("BASE_RPC_URL not set in environment");
 }
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-if (!PRIVATE_KEY) {
-    throw new Error("PRIVATE_KEY not set in environment");
+if (ENABLE_EXECUTION && !PRIVATE_KEY) {
+    throw new Error("PRIVATE_KEY not set in environment (required for execution mode)");
 }
 
 const rpcProviders = RPC_URLS.map(url => new JsonRpcProvider(url));
@@ -121,7 +121,7 @@ const provider = rpcProviders.length > 1
         weight: 1
     })))
     : rpcProviders[0];
-const wallet = new Wallet(PRIVATE_KEY, provider);
+const wallet = PRIVATE_KEY ? new Wallet(PRIVATE_KEY, provider) : null;
 const poolCache = new PoolCache();
 
 function buildDexProviders(): DexQuoteProvider[] {
@@ -206,20 +206,21 @@ async function usdToTokenAmount(usd: number, token: string): Promise<bigint> {
     return parseUnits(tokenAmount.toFixed(6), decimals);
 }
 
-// Raw quote helper (no DEX provider needed — use a direct quoter via a temporary provider)
-let _priceProvider: DexQuoteProvider | null = null;
+// USD pricing helper: try every configured DEX provider (Uniswap first —
+// deepest liquidity), then fall back to the static USDAmountConverter table.
+let _priceProviders: DexQuoteProvider[] | null = null;
 const _usdPriceCache = new Map<string, { price: number; expiresAt: number }>();
 async function quoteOnRaw(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<QuoteResult | null> {
-    // Reuse the UniswapV3 provider as the price reference (deepest liquidity).
-    if (!_priceProvider) {
-        if (!process.env.UNISWAP_QUOTER_ADDRESS || !process.env.UNISWAP_FACTORY_ADDRESS) return null;
-        _priceProvider = new UniswapV3DexProvider(
-            provider, poolCache,
-            process.env.UNISWAP_QUOTER_ADDRESS,
-            process.env.UNISWAP_FACTORY_ADDRESS
-        );
+    if (!_priceProviders) _priceProviders = buildDexProviders();
+    for (const p of _priceProviders) {
+        try {
+            const q = await p.quote({ tokenIn, tokenOut, amountIn });
+            if (q && q.amountOut > 0n) return q;
+        } catch {
+            // Try the next provider.
+        }
     }
-    return _priceProvider.quote({ tokenIn, tokenOut, amountIn });
+    return null;
 }
 
 async function tokenUsdPrice(token: string): Promise<number> {
@@ -232,11 +233,21 @@ async function tokenUsdPrice(token: string): Promise<number> {
     const cached = _usdPriceCache.get(lower);
     if (cached && cached.expiresAt > Date.now()) return cached.price;
     const quote = await quoteOnRaw(token, TOKENS.USDC, parseUnits("1", getDecimals(token)));
-    if (!quote || quote.amountOut <= 0n) throw new Error(`No USD price available for ${token}`);
-    const price = Number(formatUnits(quote.amountOut, getDecimals(TOKENS.USDC)));
-    if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid USD price for ${token}`);
-    _usdPriceCache.set(lower, { price, expiresAt: Date.now() + 30_000 });
-    return price;
+    if (quote && quote.amountOut > 0n) {
+        const price = Number(formatUnits(quote.amountOut, getDecimals(TOKENS.USDC)));
+        if (Number.isFinite(price) && price > 0) {
+            _usdPriceCache.set(lower, { price, expiresAt: Date.now() + 30_000 });
+            return price;
+        }
+    }
+
+    // Last resort: static price table — better than failing the whole pair.
+    const tablePrice = getTokenPriceUSD(token);
+    if (Number.isFinite(tablePrice) && tablePrice > 0) {
+        _usdPriceCache.set(lower, { price: tablePrice, expiresAt: Date.now() + 300_000 });
+        return tablePrice;
+    }
+    throw new Error(`No USD price available for ${token}`);
 }
 
 async function tokenAmountToUsd(amount: bigint, token: string): Promise<number> {
@@ -569,7 +580,7 @@ async function main() {
     }
     console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: $${TEST_AMOUNT_USD} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms | Slippage: ${SLIPPAGE_PCT}%`);
     console.log(`Execution: ${ENABLE_EXECUTION ? "ENABLED" : "DISABLED (watch only)"}`);
-    console.log(`Signer: ${wallet.address}`);
+    console.log(`Signer: ${wallet ? wallet.address : "n/a (watch-only, no PRIVATE_KEY)"}`);
     console.log();
 
     let dexProviders = buildDexProviders();
@@ -601,7 +612,7 @@ async function main() {
                     EXECUTE_ARBITRAGE_ABI,
                     VALIDATE_ROUTE_ABI
                 ],
-                wallet
+                wallet!
             );
             executor = new FlashLoanExecutor(engineContract, adapterRegistry);
 
