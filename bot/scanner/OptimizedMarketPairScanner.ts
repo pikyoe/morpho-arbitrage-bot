@@ -8,6 +8,7 @@ import { PositionPoint, PositionSizer } from "./PositionSizer.js";
 import { ProfitCurve } from "./ProfitCurve.js";
 import { ProfitPeakDetector } from "./ProfitPeakDetector.js";
 import { QuoteResult } from "./quote/index.js";
+import { PoolCache } from "./PoolCache.js";
 import type { QuoteCache } from "./QuoteCache.js";
 import { getQuoteCache } from "./QuoteCache.js";
 
@@ -30,7 +31,6 @@ export interface OptimizedScannerConfig {
     minLiquidityETH?: number; // Skip pools with liquidity below threshold
     enableQuoteCache?: boolean; // Enable quote result caching
     quoteCacheTTL?: number; // Quote cache TTL in milliseconds
-    minPriceImpact?: number; // Minimum acceptable price impact fraction
     maxPriceImpact?: number; // Maximum acceptable price impact fraction
 }
 
@@ -39,20 +39,42 @@ export class OptimizedMarketPairScanner {
     private readonly FLASH_LOAN_FEE = 0.0005;
     private readonly SAFETY_BUFFER = 0.25;
     private quoteCache: QuoteCache;
+    private poolCache?: PoolCache;
     
     constructor(
         private readonly quoteEngine: QuoteEngine,
         private readonly priceOracle?: PriceOracle,
-        private readonly config: OptimizedScannerConfig = {}
+        private readonly config: OptimizedScannerConfig = {},
+        poolCache?: PoolCache
     ) {
+        this.poolCache = poolCache;
         this.config.topNForwardQuotes = config.topNForwardQuotes ?? 3;
         this.config.minLiquidityETH = config.minLiquidityETH ?? 10;
         this.config.enableQuoteCache = config.enableQuoteCache ?? true;
         this.config.quoteCacheTTL = config.quoteCacheTTL ?? 3000;
-        this.config.minPriceImpact = config.minPriceImpact ?? 0.01;
         this.config.maxPriceImpact = config.maxPriceImpact ?? 0.015;
         
         this.quoteCache = getQuoteCache(this.config.quoteCacheTTL);
+    }
+
+    private pairExistsOnBothDexes(tokenA: string, tokenB: string): boolean {
+        if (!this.poolCache) {
+            return true;
+        }
+
+        const pools = this.poolCache.getAll().filter(pool => {
+            const token0 = pool.token0.toLowerCase();
+            const token1 = pool.token1.toLowerCase();
+            const input = tokenA.toLowerCase();
+            const output = tokenB.toLowerCase();
+            return (
+                (token0 === input && token1 === output) ||
+                (token1 === input && token0 === output)
+            );
+        });
+
+        const dexSet = new Set(pools.map(pool => pool.dex));
+        return dexSet.size >= 2;
     }
 
     public async scan(
@@ -65,13 +87,43 @@ export class OptimizedMarketPairScanner {
             : AdaptivePositionSearcher.generate(DefaultPositionSearchConfig);
 
         const gasPrice = await this.priceOracle?.getGasPrice() ?? 0n;
-        const ethPriceUSDValue = await this.priceOracle?.getEthPriceUSD() ?? 0;
+        let ethPriceUSDValue = 0;
+
+        try {
+            ethPriceUSDValue = await this.priceOracle?.getEthPriceUSD() ?? 0;
+        } catch (error) {
+            console.warn(
+                "Unable to determine ETH price for scan",
+                tokenA,
+                "->",
+                tokenB,
+                "error:",
+                error
+            );
+            return [];
+        }
+
+        if (ethPriceUSDValue <= 0) {
+            console.warn(
+                "Invalid ETH price returned for scan",
+                tokenA,
+                "->",
+                tokenB,
+                "price=",
+                ethPriceUSDValue
+            );
+            return [];
+        }
 
         const bestCandidates: ArbitrageCandidate[] = [];
         const tested: PositionPoint[] = [];
         const curve = new ProfitCurve();
 
         for (const amountIn of amounts) {
+            if (!this.pairExistsOnBothDexes(tokenA, tokenB)) {
+                return [];
+            }
+
             // OPTIMIZATION 1: Get all forward quotes ONCE per amount
             const forwardQuotes = await this.getForwardQuotesWithCache(
                 tokenA,
@@ -83,11 +135,9 @@ export class OptimizedMarketPairScanner {
                 continue;
             }
 
-            const minPriceImpact = this.config.minPriceImpact ?? 0.01;
             const maxPriceImpact = this.config.maxPriceImpact ?? 0.015;
             const filteredForwardQuotes = this.filterQuotesByPriceImpact(
                 forwardQuotes,
-                minPriceImpact,
                 maxPriceImpact
             );
 
@@ -113,7 +163,6 @@ export class OptimizedMarketPairScanner {
 
                 const filteredReverseQuotes = this.filterQuotesByPriceImpact(
                     reverseQuotes,
-                    minPriceImpact,
                     maxPriceImpact
                 );
 
@@ -220,7 +269,7 @@ export class OptimizedMarketPairScanner {
     ): Promise<QuoteResult[]> {
         if (this.config.enableQuoteCache) {
             // Try to get from cache first
-            const cachedResults = this.quoteCache.getMultiple(tokenIn, tokenOut, amountIn, "UNISWAP");
+            const cachedResults = this.quoteCache.getMultiple(tokenIn, tokenOut, amountIn);
             if (cachedResults.length > 0) {
                 console.log(`Quote cache hit for ${tokenIn} -> ${tokenOut}`);
                 return cachedResults;
@@ -251,7 +300,7 @@ export class OptimizedMarketPairScanner {
     ): Promise<QuoteResult[]> {
         if (this.config.enableQuoteCache) {
             // Try to get from cache first
-            const cachedResults = this.quoteCache.getMultiple(tokenIn, tokenOut, amountIn, "UNISWAP");
+            const cachedResults = this.quoteCache.getMultiple(tokenIn, tokenOut, amountIn);
             if (cachedResults.length > 0) {
                 return cachedResults;
             }
@@ -295,7 +344,6 @@ export class OptimizedMarketPairScanner {
 
     private filterQuotesByPriceImpact(
         quotes: QuoteResult[],
-        minImpact: number,
         maxImpact: number
     ): QuoteResult[] {
         if (quotes.length === 0) {
@@ -313,7 +361,7 @@ export class OptimizedMarketPairScanner {
         return quotes.filter(q => {
             const price = Number(q.amountOut) / Number(q.amountIn);
             const impact = 1 - price / bestPrice;
-            return impact >= minImpact && impact <= maxImpact;
+            return impact >= 0 && impact <= maxImpact;
         });
     }
 

@@ -1,15 +1,19 @@
+import { setTimeout as sleep } from "timers/promises";
 import { ArbitrageCandidate } from "./MarketPairScanner.js";
-import { MarketPairScanner } from "./MarketPairScanner.js";
+
+export interface IPairScanner {
+    scan(tokenA: string, tokenB: string, defaultAmount?: bigint): Promise<ArbitrageCandidate[]>;
+}
 
 export class ParallelMarketScanner {
 
     constructor(
 
-        private readonly pairScanner: MarketPairScanner,
+        private readonly pairScanner: IPairScanner,
 
         private readonly tokens: string[],
 
-        private readonly concurrency = 5
+        private readonly concurrency = 1
 
     ) {}
 
@@ -42,37 +46,27 @@ export class ParallelMarketScanner {
         }
 
         const result: ArbitrageCandidate[] = [];
+        const delayMs = Math.max(50, Math.min(200, Math.floor(1000 / Math.max(1, this.concurrency))));
 
         let index = 0;
-
         while (index < jobs.length) {
-
-            const batch = jobs.slice(
-
-                index,
-
-                index + this.concurrency
-
-            );
-
-            const scanned = await Promise.all(
-
-                batch.map(
-
-                    job => job()
-
-                )
-
-            );
-
-            result.push(
-
-                ...scanned.flat()
-
-            );
+            const batch = jobs.slice(index, index + this.concurrency);
+            for (const job of batch) {
+                try {
+                    const scanned = await job();
+                    result.push(...scanned);
+                } catch (error) {
+                    console.warn(
+                        "Market pair scan failed, skipping pair:",
+                        error
+                    );
+                }
+            }
 
             index += this.concurrency;
-
+            if (index < jobs.length) {
+                await sleep(delayMs);
+            }
         }
 
         result.sort(

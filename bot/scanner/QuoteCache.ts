@@ -44,18 +44,29 @@ export class QuoteCache {
         return cached.result;
     }
 
-    getMultiple(tokenIn: string, tokenOut: string, amountIn: bigint, dex: string): QuoteResult[] {
+    getMultiple(tokenIn: string, tokenOut: string, amountIn: bigint, dex?: string): QuoteResult[] {
         const results: QuoteResult[] = [];
         const now = Date.now();
+        const normalizedPrefix = `${tokenIn.toLowerCase()}-${tokenOut.toLowerCase()}-${amountIn.toString()}`;
 
-        for (const [key, cached] of this.cache.entries()) {
-            // Check if key matches pattern (simple matching)
-            if (key.includes(`${tokenIn.toLowerCase()}-${tokenOut.toLowerCase()}-${amountIn.toString()}-${dex}`)) {
-                if (now - cached.timestamp <= this.ttl) {
-                    results.push(cached.result);
-                } else {
-                    this.cache.delete(key);
+        for (const entry of Array.from(this.cache.entries())) {
+            const [key, cached] = entry;
+            const normalizedKey = key.toLowerCase();
+            if (!normalizedKey.startsWith(normalizedPrefix)) {
+                continue;
+            }
+
+            if (dex) {
+                const expectedPrefix = `${normalizedPrefix}-${dex.toLowerCase()}`;
+                if (!normalizedKey.startsWith(expectedPrefix)) {
+                    continue;
                 }
+            }
+
+            if (now - cached.timestamp <= this.ttl) {
+                results.push(cached.result);
+            } else {
+                this.cache.delete(key);
             }
         }
 

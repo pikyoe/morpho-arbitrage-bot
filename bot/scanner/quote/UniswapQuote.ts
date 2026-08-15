@@ -7,6 +7,7 @@ import {
     QuoteResult,
     IQuoteProvider
 } from "./index.js";
+import { rpcRateLimiter } from "../../utils/RateLimiter.js";
 
 import { UNISWAP_QUOTER_ABI } from "../abis/UniswapQuoter.js";
 
@@ -112,6 +113,8 @@ export class UniswapQuote
         for (const pool of pools) {
 
             try {
+
+                await rpcRateLimiter.wait();
 
                 const quote =
                     await this.quoter.quoteExactInputSingle.staticCall(

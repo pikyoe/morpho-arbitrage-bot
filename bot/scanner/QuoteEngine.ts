@@ -1,23 +1,25 @@
 import {
-
     QuoteRequest,
     QuoteResult,
     IQuoteProvider
-
 } from "./quote/index.js";
+import { DexQuoteProvider } from "./quote/DexQuoteProvider.js";
+import { quoteRateLimiter } from "../utils/RateLimiter.js";
 
 export class QuoteEngine {
 
     private providers: IQuoteProvider[];
 
     constructor(
-
         providers: IQuoteProvider[] = []
-
     ) {
-
         this.providers = providers;
-
+        
+        // Debug: Log all registered providers
+        console.log(`[QuoteEngine] Initialized with ${providers.length} providers:`);
+        for (const provider of providers) {
+            console.log(`  - ${provider.constructor.name}`);
+        }
     }
 
     registerProvider(
@@ -36,21 +38,27 @@ export class QuoteEngine {
 
     ): Promise<QuoteResult[]> {
 
-        const responses =
+        const quotes: QuoteResult[] = [];
 
-            await Promise.all(
+        for (const provider of this.providers) {
 
-                this.providers.map(
+            await quoteRateLimiter.wait();
 
-                    p => p.quote(request)
+            try {
+                const response = await provider.quote(request);
+                quotes.push(...response);
+            } catch (error) {
+                console.warn(
+                    "Quote provider failed for",
+                    request.tokenIn,
+                    "->",
+                    request.tokenOut,
+                    "error:",
+                    error
+                );
+            }
 
-                )
-
-            );
-
-        const quotes =
-
-            responses.flat();
+        }
 
         quotes.sort(
 

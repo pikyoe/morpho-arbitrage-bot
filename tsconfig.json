@@ -20,7 +20,10 @@
     "outDir": "dist"
   },
   "include": [
-    "src/**/*.ts"
+    "src/**/*.ts",
+    "bot/**/*.ts",
+    "scripts/**/*.ts",
+    "hardhat.config.ts"
   ],
   "exclude": [
     "node_modules",

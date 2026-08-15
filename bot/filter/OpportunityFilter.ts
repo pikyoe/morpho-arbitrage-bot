@@ -14,6 +14,8 @@ export interface FilterConfig {
 
     minNetProfitUSD: number;
 
+    minGrossProfitUSD?: number;
+
     maxGasRatio: number;
 
     minROI: number;
@@ -40,6 +42,11 @@ export class OpportunityFilter {
         opportunity: Opportunity
     ): FilterResult {
 
+        if (![opportunity.loanAmountUSD, opportunity.grossProfitUSD,
+            opportunity.netProfitUSD, opportunity.gasRatio].every(Number.isFinite)) {
+            return { accepted: false, reason: "InvalidMetrics" };
+        }
+
         if (
             opportunity.loanAmountUSD <
             this.config.minLoanUSD
@@ -53,6 +60,13 @@ export class OpportunityFilter {
 
             };
 
+        }
+
+        if (
+            this.config.minGrossProfitUSD !== undefined &&
+            opportunity.grossProfitUSD < this.config.minGrossProfitUSD
+        ) {
+            return { accepted: false, reason: "GrossProfit" };
         }
 
         if (

@@ -3,7 +3,7 @@ export class RateLimiter {
     private maxRequests: number;
     private windowMs: number;
 
-    constructor(maxRequests: number = 10, windowMs: number = 1000) {
+    constructor(maxRequests: number = 5, windowMs: number = 60000) {
         this.maxRequests = maxRequests;
         this.windowMs = windowMs;
     }
@@ -22,7 +22,6 @@ export class RateLimiter {
             const waitTime = this.windowMs - (now - oldestRequest);
             
             if (waitTime > 0) {
-                console.log("Rate limit reached, waiting " + waitTime + "ms");
                 await new Promise(resolve => setTimeout(resolve, waitTime));
             }
         }
@@ -44,3 +43,4 @@ export class RateLimiter {
 export const rpcRateLimiter = new RateLimiter(20, 1000); // 20 requests per second
 export const quoteRateLimiter = new RateLimiter(10, 1000); // 10 quotes per second
 export const stateRateLimiter = new RateLimiter(15, 1000); // 15 state updates per second
+export const zeroXRateLimiter = new RateLimiter(1, 2000); // 1 request per 2 seconds (30 req/min - conservative for free tier)
