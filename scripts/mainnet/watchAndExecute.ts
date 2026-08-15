@@ -46,7 +46,7 @@ if (process.env.ENV_FILE) {
 const WATCH_PAIR_A = process.env.WATCH_TOKEN_A || TOKENS.WETH;
 const WATCH_PAIR_B = process.env.WATCH_TOKEN_B || TOKENS.AERO;
 // WATCH_MODE: "single" (default, pair A/B) | "all" (semua pair dari token universe) | "list" (pair dari WATCH_PAIRS)
-const WATCH_MODE_RAW = (process.env.WATCH_MODE || "all").toLowerCase();
+const WATCH_MODE_RAW = (process.env.WATCH_MODE || "single").toLowerCase();
 if (WATCH_MODE_RAW !== "single" && WATCH_MODE_RAW !== "all" && WATCH_MODE_RAW !== "list") {
     throw new Error(`Invalid WATCH_MODE "${WATCH_MODE_RAW}" — expected "single", "all", or "list"`);
 }
@@ -604,6 +604,26 @@ async function netProfitAfterGasUSD(opp: any, token: string): Promise<number> {
 // Main
 // ------------------------------------------------------------------
 async function main() {
+    // Summary stats + graceful shutdown on Ctrl-C. Registered early so a
+    // Ctrl-C during the initial pool load also prints the summary.
+    let statsLoops = 0;
+    let statsSpreads = 0;
+    let statsExecuted = 0;
+    let statsFailed = 0;
+    const statsStart = Date.now();
+    const printSummary = (): void => {
+        const runtimeSec = ((Date.now() - statsStart) / 1000).toFixed(1);
+        console.log(`\n📊 Watch summary — runtime ${runtimeSec}s, ${statsLoops} loops`);
+        console.log(`   spreads detected: ${statsSpreads} | executed: ${statsExecuted} | failed: ${statsFailed}`);
+        if (statsExecuted + statsFailed > 0) {
+            console.log(`   success rate: ${((statsExecuted / (statsExecuted + statsFailed)) * 100).toFixed(0)}%`);
+        }
+    };
+    process.on("SIGINT", () => {
+        printSummary();
+        process.exit(0);
+    });
+
     const network = await provider.getNetwork();
     if (network.chainId !== 8453n) {
         throw new Error(`Wrong network: expected Base mainnet (8453), got ${network.chainId}`);
@@ -816,6 +836,7 @@ async function main() {
     // eslint-disable-next-line no-constant-condition
     while (true) {
         loop++;
+        statsLoops++;
         const startTime = Date.now();
 
         // Advance the test-size ladder (cycle back to the start at the top).
@@ -862,6 +883,7 @@ async function main() {
             const { spreadPct, netProfitUSD, forward, reverse, amountIn, profit } = best;
             const tokenA = forward.tokenIn;
             console.log(`\n[${new Date().toISOString()}] 🎯 Best cross-DEX spread: ${tokenA.slice(0,6)}↔${forward.tokenOut.slice(0,6)} ${forward.dex}→${reverse.dex} = ${spreadPct.toFixed(3)}% | net ~$${netProfitUSD.toFixed(2)}`);
+            statsSpreads++;
 
             // Threshold checks (same as single mode)
             if (spreadPct < SPREAD_THRESHOLD_PCT) {
@@ -906,8 +928,10 @@ async function main() {
                 const result = await executor.executeFlashLoan(opp);
                 if (result.success) {
                     console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
+                    statsExecuted++;
                 } else {
                     console.log(`  ❌ Execution failed: ${result.error}`);
+                    statsFailed++;
                 }
             } catch (e: any) {
                 console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
@@ -1006,6 +1030,7 @@ async function main() {
 
         const { spreadPct, netProfitUSD, forward, reverse } = best;
         console.log(`\n[${new Date().toISOString()}] 🎯 Cross-DEX spread detected: ${forward.dex}→${reverse.dex} = ${spreadPct.toFixed(3)}% | net ~$${netProfitUSD.toFixed(2)}`);
+        statsSpreads++;
 
         // Threshold check
         if (spreadPct < SPREAD_THRESHOLD_PCT) {
@@ -1056,8 +1081,10 @@ async function main() {
             const result = await executor.executeFlashLoan(opp);
             if (result.success) {
                 console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
+                statsExecuted++;
             } else {
                 console.log(`  ❌ Execution failed: ${result.error}`);
+                statsFailed++;
             }
         } catch (e: any) {
             console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
