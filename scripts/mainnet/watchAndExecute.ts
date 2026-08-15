@@ -580,23 +580,18 @@ async function buildOpportunity(
 }
 
 /**
- * Net profit after estimated gas (in USD). Gas limit comes from an on-chain
- * simulation when possible (estimateOpportunityGas), otherwise a flat estimate;
- * gas price from the provider's latest fee data. Falls back to the raw net
- * profit when pricing is unavailable so monitoring is never blocked.
+ * Net profit after estimated gas (in USD). Deliberately cheap — no on-chain
+ * simulation between detection and execution, so a detected spread is not
+ * lost while gas is estimated. Flat gas limit × current gas price × WETH
+ * price (cached); the executor re-estimates gas precisely when sending.
  */
-async function netProfitAfterGasUSD(ex: FlashLoanExecutor, opp: any, token: string): Promise<number> {
+async function netProfitAfterGasUSD(opp: any, token: string): Promise<number> {
     const base = opp?.netProfitUSD || 0;
     try {
         const feeData = await provider.getFeeData();
         const gasPrice = feeData?.maxFeePerGas ?? feeData?.gasPrice ?? 0n;
         if (gasPrice <= 0n) return base;
-        let gasLimit = 600000n; // typical flash-loan arbitrage gas
-        try {
-            gasLimit = await ex.estimateOpportunityGas(opp, token);
-        } catch {
-            // Route not simulatable (e.g. adapter not deployed) — keep flat estimate.
-        }
+        const gasLimit = 600000n; // typical flash-loan arbitrage gas
         const ethPrice = await tokenUsdPrice(TOKENS.WETH);
         const gasUSD = Number(formatUnits(gasPrice * gasLimit, 18)) * ethPrice;
         return Math.max(0, base - gasUSD);
@@ -899,7 +894,7 @@ async function main() {
                 continue;
             }
 
-            const netAfterGas = await netProfitAfterGasUSD(executor, opp, tokenA);
+            const netAfterGas = await netProfitAfterGasUSD(opp, tokenA);
             if (netAfterGas < MIN_NET_PROFIT_USD) {
                 console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
                 await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
@@ -1048,7 +1043,7 @@ async function main() {
             continue;
         }
 
-        const netAfterGas = await netProfitAfterGasUSD(executor, opp, WATCH_PAIR_A);
+        const netAfterGas = await netProfitAfterGasUSD(opp, WATCH_PAIR_A);
         if (netAfterGas < MIN_NET_PROFIT_USD) {
             console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
