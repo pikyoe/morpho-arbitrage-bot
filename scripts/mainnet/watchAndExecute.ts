@@ -913,7 +913,8 @@ async function main() {
                 console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
             }
 
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            // Rescan immediately after an execution attempt — the spread may
+            // still be live and the next quote decides whether to act again.
             continue;
         }
 
@@ -1062,7 +1063,7 @@ async function main() {
             console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
         }
 
-        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        // Rescan immediately after an execution attempt (see multi-pair mode).
     }
 }
 
