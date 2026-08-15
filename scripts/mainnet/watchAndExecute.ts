@@ -68,9 +68,21 @@ const MIN_NET_PROFIT_USD = Number(process.env.MIN_NET_PROFIT_USD || 1);
 const MAX_QUOTE_DEVIATION_X = Math.max(2, Number(process.env.MAX_QUOTE_DEVIATION_X || 10));
 const POLL_INTERVAL_MS = Number(process.env.WATCH_POLL_MS || 5000); // 5s default
 const MAX_LOAN_USD = Number(process.env.WATCH_MAX_LOAN_USD || 10000);
-const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION !== "false"; // default true
+// Fail closed: execution requires an explicit WATCH_ENABLE_EXECUTION=true.
+const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION === "true"; // default OFF
 // Slippage tolerance: default 0.1%, clamped to [0.1%, 1.5%] — never defaults to the max.
 const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.1), 0.1), 1.5);
+// minProfit floor: keep this % of the quoted profit on-chain (clamped 10–90%).
+// Demanding the full quoted profit reverts InsufficientProfit on any adverse
+// price move between quote and execution; a fractional floor tolerates drift
+// while still guaranteeing the trade clears a share of its quoted edge.
+const MIN_PROFIT_BUFFER_PCT = Math.min(Math.max(Number(process.env.MIN_PROFIT_BUFFER_PCT || 50), 10), 90);
+// Optional flash-token allowlist (comma-separated addresses, case-insensitive).
+// The Morpho flash-loan path repays exactly the borrowed amount; flashed tokens
+// must have a 0 borrow fee on Morpho or repayment reverts. When set, execution
+// is restricted to these tokens (empty = no restriction, warned at startup).
+const FLASH_TOKEN_ALLOWLIST = (process.env.FLASH_TOKEN_ALLOWLIST || "")
+    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 const VERBOSE = process.env.WATCH_VERBOSE === "true";
 const GENERAL_DEX_NAMES = ["UniswapV3", "SushiSwap", "PancakeSwap"];
 const EFFECTIVE_TEST_AMOUNT_USD = Math.min(TEST_AMOUNT_USD, MAX_LOAN_USD);
@@ -499,13 +511,42 @@ async function buildOpportunity(
         route: {
             swaps: steps,
             profitToken: tokenIn,
-            minProfit: profit
+            // Never demand the full quoted profit on-chain: a small adverse price
+            // move between quote and execution would revert InsufficientProfit.
+            // Keep a MIN_PROFIT_BUFFER_PCT% floor of the quoted profit instead.
+            minProfit: (profit * (100n - BigInt(MIN_PROFIT_BUFFER_PCT))) / 100n
         },
         inputAmount: amountIn,
         outputAmount: amountIn + profit,
         profit,
         netProfitUSD
     };
+}
+
+/**
+ * Net profit after estimated gas (in USD). Gas limit comes from an on-chain
+ * simulation when possible (estimateOpportunityGas), otherwise a flat estimate;
+ * gas price from the provider's latest fee data. Falls back to the raw net
+ * profit when pricing is unavailable so monitoring is never blocked.
+ */
+async function netProfitAfterGasUSD(ex: FlashLoanExecutor, opp: any, token: string): Promise<number> {
+    const base = opp?.netProfitUSD || 0;
+    try {
+        const feeData = await provider.getFeeData();
+        const gasPrice = feeData?.maxFeePerGas ?? feeData?.gasPrice ?? 0n;
+        if (gasPrice <= 0n) return base;
+        let gasLimit = 600000n; // typical flash-loan arbitrage gas
+        try {
+            gasLimit = await ex.estimateOpportunityGas(opp, token);
+        } catch {
+            // Route not simulatable (e.g. adapter not deployed) — keep flat estimate.
+        }
+        const ethPrice = await tokenUsdPrice(TOKENS.WETH);
+        const gasUSD = Number(formatUnits(gasPrice * gasLimit, 18)) * ethPrice;
+        return Math.max(0, base - gasUSD);
+    } catch {
+        return base;
+    }
 }
 
 // ------------------------------------------------------------------
@@ -528,7 +569,7 @@ async function main() {
     console.log(`Signer: ${wallet.address}`);
     console.log();
 
-    const dexProviders = buildDexProviders();
+    let dexProviders = buildDexProviders();
     if (dexProviders.length < 2) {
         console.log("⚠️ Need at least 2 DEX providers configured. Check env (UNISWAP/SUSHISWAP/PANCAKESWAP/AERODROME *_QUOTER/_FACTORY).");
         return;
@@ -560,6 +601,35 @@ async function main() {
                 wallet
             );
             executor = new FlashLoanExecutor(engineContract, adapterRegistry);
+
+            // Only DEXes with a configured adapter can execute (the deployed
+            // engine approves specific adapters). Restrict scanning in execution
+            // mode so opportunities that could never pass validateRoute are not
+            // surfaced as executable candidates.
+            const withAdapter = dexProviders.filter(d => {
+                try {
+                    return /^0x[a-fA-F0-9]{40}$/.test(adapterRegistry!.get(d.getDexName()));
+                } catch {
+                    return false;
+                }
+            });
+            if (withAdapter.length !== dexProviders.length) {
+                const dropped = dexProviders.filter(d => !withAdapter.includes(d)).map(d => d.getDexName());
+                console.log(`  ⚠️ Execution mode: ${dropped.join(", ")} has a quoter but no configured adapter — scanning only ${withAdapter.map(d => d.getDexName()).join(", ")}`);
+            }
+            if (withAdapter.length > 0) dexProviders = withAdapter;
+            if (dexProviders.length < 2) {
+                console.log("  ⚠️ Fewer than 2 executable DEXes — no cross-DEX arbitrage possible in execution mode");
+            }
+
+            // The Morpho flash-loan path repays exactly the borrowed amount; if
+            // the flashed token has a nonzero borrow fee on Morpho, repayment
+            // reverts. FLASH_TOKEN_ALLOWLIST restricts execution to safe tokens.
+            if (FLASH_TOKEN_ALLOWLIST.length === 0) {
+                console.log("  ⚠️ FLASH_TOKEN_ALLOWLIST empty — flashed tokens must have a 0 borrow fee on Morpho, otherwise repayment reverts");
+            } else {
+                console.log(`  🔒 Execution restricted to flash tokens: ${FLASH_TOKEN_ALLOWLIST.join(", ")}`);
+            }
             console.log(`✅ Execution ready (engine ${engineAddress.slice(0,8)}…)\n`);
         }
     }
@@ -675,8 +745,14 @@ async function main() {
     await refreshPoolCache();
     console.log();
     if (WATCH_MODE === "single") {
-        amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
-        console.log(`Single-pair monitoring amount: ${formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${EFFECTIVE_TEST_AMOUNT_USD})\n`);
+        try {
+            amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
+            console.log(`Single-pair monitoring amount: ${formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${EFFECTIVE_TEST_AMOUNT_USD})\n`);
+        } catch (e: any) {
+            console.error(`❌ Cannot size the monitoring amount for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}).`);
+            console.error("   USD pricing needs UNISWAP_QUOTER_ADDRESS/UNISWAP_FACTORY_ADDRESS (or use WATCH_MODE=list). Exiting.");
+            process.exit(1);
+        }
     }
 
     const scanPairs = resolveScanPairs();
@@ -742,6 +818,13 @@ async function main() {
                 continue;
             }
 
+            // Flash-token allowlist guard (see FLASH_TOKEN_ALLOWLIST).
+            if (FLASH_TOKEN_ALLOWLIST.length > 0 && !FLASH_TOKEN_ALLOWLIST.includes(tokenA.toLowerCase())) {
+                if (VERBOSE) console.log(`  ⏭️ ${tokenA.slice(0,6)} not in FLASH_TOKEN_ALLOWLIST — skipping execution`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
+            }
+
             const opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
             try {
                 const ok = await engineContract!.validateRoute(opp.route, tokenA);
@@ -756,7 +839,14 @@ async function main() {
                 continue;
             }
 
-            console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})…`);
+            const netAfterGas = await netProfitAfterGasUSD(executor, opp, tokenA);
+            if (netAfterGas < MIN_NET_PROFIT_USD) {
+                console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
+            }
+
+            console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
             try {
                 const result = await executor.executeFlashLoan(opp);
                 if (result.success) {
@@ -775,8 +865,16 @@ async function main() {
         // -------- Single-pair mode (default) --------
         // Safety net: single mode computes the test amount at startup, but
         // recompute lazily so the loop can never read an unassigned value.
+        // If the USD price is temporarily unavailable, skip this loop instead
+        // of crashing the watcher.
         if (amountInSingle === undefined) {
-            amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
+            try {
+                amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
+            } catch (e: any) {
+                console.log(`  ⚠️ Cannot size amount for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}) — skipping loop`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
+            }
         }
         const amountIn = amountInSingle;
         // Quote token A -> token B (buy) on every DEX
@@ -787,10 +885,18 @@ async function main() {
             if (qBuy) buyQuotes.push({ dex: dex.getDexName(), q: qBuy });
 
         }
+        // Same outlier guard as multi-pair mode: drop stale/dust quotes so a
+        // phantom spread cannot trigger a gas-burning execution attempt.
+        const saneBuyQuotes = filterQuoteOutliers(buyQuotes, "buy");
+        if (saneBuyQuotes.length < 2) {
+            if (VERBOSE) console.log(`  [loop ${loop}] <2 sane buy quotes (${buyQuotes.length} raw) — skipping`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
+        }
 
         if (VERBOSE) {
             console.log(`\n[loop ${loop}] Quotes (${WATCH_PAIR_A.slice(0,6)}→${WATCH_PAIR_B.slice(0,6)}):`);
-            for (const { dex, q } of buyQuotes) {
+            for (const { dex, q } of saneBuyQuotes) {
                 console.log(`  ${dex}: ${formatAmount(q.amountOut, WATCH_PAIR_B)} ${WATCH_PAIR_B.slice(0,6)} (fee ${q.fee ?? "?"})`);
             }
         }
@@ -806,13 +912,14 @@ async function main() {
         // we approximate: use the sell quote on dex j for the amount of B that buy on i produced.
         // (In practice for monitoring, quoting both directions on each dex and comparing
         //  the implied rate is sufficient to detect large cross-DEX discrepancies.)
-        for (const buy of buyQuotes) {
+        for (const buy of saneBuyQuotes) {
+            const sellQuotes: { dex: string; q: QuoteResult }[] = [];
             for (const sellDex of dexProviders) {
                 if (buy.dex === sellDex.getDexName()) continue;
                 const sellQuote = await quoteOn(sellDex, WATCH_PAIR_B, WATCH_PAIR_A, buy.q.amountOut);
-                if (!sellQuote) continue;
-                const sell = { dex: sellDex.getDexName(), q: sellQuote };
-
+                if (sellQuote) sellQuotes.push({ dex: sellDex.getDexName(), q: sellQuote });
+            }
+            for (const sell of filterQuoteOutliers(sellQuotes, "sell")) {
                 const amountBack = sell.q.amountOut; // in token A
                 if (amountBack <= amountIn) continue;
 
@@ -863,6 +970,13 @@ async function main() {
             continue;
         }
 
+        // Flash-token allowlist guard (see FLASH_TOKEN_ALLOWLIST).
+        if (FLASH_TOKEN_ALLOWLIST.length > 0 && !FLASH_TOKEN_ALLOWLIST.includes(WATCH_PAIR_A.toLowerCase())) {
+            if (VERBOSE) console.log(`  ⏭️ ${WATCH_PAIR_A.slice(0,6)} not in FLASH_TOKEN_ALLOWLIST — skipping execution`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
+        }
+
         // Build opportunity & execute
         const profit = reverse.amountOut - amountIn;
         const opp = await buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
@@ -881,7 +995,14 @@ async function main() {
             continue;
         }
 
-        console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})…`);
+        const netAfterGas = await netProfitAfterGasUSD(executor, opp, WATCH_PAIR_A);
+        if (netAfterGas < MIN_NET_PROFIT_USD) {
+            console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
+        }
+
+        console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
         try {
             const result = await executor.executeFlashLoan(opp);
             if (result.success) {
