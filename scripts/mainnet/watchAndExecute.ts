@@ -1,9 +1,10 @@
-import "dotenv/config";
 import * as dotenv from "dotenv";
 import {
     JsonRpcProvider,
+    FallbackProvider,
     Wallet,
     Contract,
+    AbiCoder,
     parseUnits,
     formatUnits
 } from "ethers";
@@ -23,7 +24,12 @@ import { TOKEN_DECIMALS, TOKENS } from "../../bot/scanner/TokenList.js";
 import { TIER_1_TOKENS, TIER_2_TOKENS } from "../../bot/scanner/TokenUniverse.js";
 import { toUniquePairs, batchPairs, filterPairs } from "../../bot/scanner/UniversalPairFilter.js";
 
-// Load optional env file
+// Load .env when no explicit environment file was supplied.
+if (!process.env.ENV_FILE) {
+    dotenv.config({ path: ".env" });
+}
+
+// Load explicit environment file before reading configuration constants.
 if (process.env.ENV_FILE) {
     const result = dotenv.config({ path: process.env.ENV_FILE });
     if (result.error) {
@@ -39,8 +45,9 @@ if (process.env.ENV_FILE) {
 const WATCH_PAIR_A = process.env.WATCH_TOKEN_A || TOKENS.WETH;
 const WATCH_PAIR_B = process.env.WATCH_TOKEN_B || TOKENS.AERO;
 // WATCH_MODE: "single" (default, pair A/B) | "all" (semua pair dari token universe) | "list" (pair dari WATCH_PAIRS)
-const WATCH_MODE = (process.env.WATCH_MODE || "single").toLowerCase();
+const WATCH_MODE = (process.env.WATCH_MODE || "all").toLowerCase();
 const WATCH_PAIRS_CSV = process.env.WATCH_PAIRS || ""; // e.g. "0xAAA,0xBBB;0xCCC,0xDDD"
+const WATCH_TOP_TOKENS = Number(process.env.WATCH_TOP_TOKENS || 0); // 0 = all tokens in the universe
 const SCAN_BATCH_SIZE = Number(process.env.SCAN_BATCH_SIZE || 8);
 const POOL_REFRESH_LOOPS = Number(process.env.WATCH_POOL_REFRESH_LOOPS || 12); // refresh pool cache every N loops (0 = never)
 const POOL_RPC_FALLBACK = process.env.POOL_RPC_FALLBACK !== "false"; // fallback to factory RPC when subgraph is thin
@@ -49,8 +56,11 @@ const MIN_DEX_VARIETY = Number(process.env.MIN_DEX_VARIETY || 2);
 const MAX_PAIRS_PER_SCAN = Number(process.env.MAX_PAIRS_PER_SCAN || 200);
 const TOP_N_CANDIDATES = Number(process.env.TOP_N_CANDIDATES || 5);
 const TEST_AMOUNT_USD = Number(process.env.WATCH_TEST_USD || 1000); // Quote size in USD
-const SPREAD_THRESHOLD_PCT = Number(process.env.SPREAD_THRESHOLD_PCT || 0.3); // e.g. 0.3%
-const MIN_NET_PROFIT_USD = Number(process.env.MIN_NET_PROFIT_USD || 2);
+const SPREAD_THRESHOLD_PCT = Number(process.env.SPREAD_THRESHOLD_PCT || 0.2); // e.g. 0.2%
+const MIN_NET_PROFIT_USD = Number(process.env.MIN_NET_PROFIT_USD || 1);
+// Same-direction quotes use identical token units. Extreme outliers are
+// generally stale/invalid pools (for example a dust quote), not real spread.
+const MAX_QUOTE_DEVIATION_X = Math.max(2, Number(process.env.MAX_QUOTE_DEVIATION_X || 10));
 const POLL_INTERVAL_MS = Number(process.env.WATCH_POLL_MS || 5000); // 5s default
 const MAX_LOAN_USD = Number(process.env.WATCH_MAX_LOAN_USD || 10000);
 const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION !== "false"; // default true
@@ -58,6 +68,15 @@ const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION !== "false"; // defa
 const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.1), 0.1), 1.5);
 const VERBOSE = process.env.WATCH_VERBOSE === "true";
 const GENERAL_DEX_NAMES = ["UniswapV3", "SushiSwap", "PancakeSwap"];
+const EFFECTIVE_TEST_AMOUNT_USD = Math.min(TEST_AMOUNT_USD, MAX_LOAN_USD);
+
+if (!Number.isFinite(TEST_AMOUNT_USD) || TEST_AMOUNT_USD <= 0) {
+    throw new Error("WATCH_TEST_USD must be a positive number");
+}
+if (!Number.isFinite(MAX_LOAN_USD) || MAX_LOAN_USD <= 0) {
+    throw new Error("WATCH_MAX_LOAN_USD must be a positive number");
+}
+const QUOTE_AMOUNT_USD = Math.min(TEST_AMOUNT_USD, MAX_LOAN_USD);
 
 // ------------------------------------------------------------------
 // ABI fragments shared with the engine (ArbitrageEngineV2)
@@ -70,8 +89,11 @@ const VALIDATE_ROUTE_ABI = `function validateRoute(${RouteTuple} route,address t
 // ------------------------------------------------------------------
 // Providers
 // ------------------------------------------------------------------
-const RPC_URL = process.env.BASE_RPC_URL || process.env.RPC_URL || "";
-if (!RPC_URL) {
+const RPC_URLS = [...new Set([
+    process.env.BASE_RPC_URL_1 || process.env.BASE_RPC_URL || process.env.RPC_URL,
+    process.env.BASE_RPC_URL_2
+].filter((url): url is string => Boolean(url)))];
+if (RPC_URLS.length === 0) {
     throw new Error("BASE_RPC_URL not set in environment");
 }
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
@@ -79,7 +101,15 @@ if (!PRIVATE_KEY) {
     throw new Error("PRIVATE_KEY not set in environment");
 }
 
-const provider = new JsonRpcProvider(RPC_URL);
+const rpcProviders = RPC_URLS.map(url => new JsonRpcProvider(url));
+const provider = rpcProviders.length > 1
+    ? new FallbackProvider(rpcProviders.map((rpc, index) => ({
+        provider: rpc,
+        priority: index + 1,
+        stallTimeout: 1500,
+        weight: 1
+    })))
+    : rpcProviders[0];
 const wallet = new Wallet(PRIVATE_KEY, provider);
 const poolCache = new PoolCache();
 
@@ -107,10 +137,14 @@ function buildDexProviders(): DexQuoteProvider[] {
             process.env.PANCAKESWAP_FACTORY_ADDRESS
         ));
     }
-    if (process.env.AERODROME_QUOTER_ADDRESS && process.env.AERODROME_FACTORY_ADDRESS) {
+    // AerodromeDexProvider uses the V2 router ABI (getAmountsOut). The
+    // Slipstream quoter address is a different contract and must never be
+    // used as a fallback here.
+    const aerodromeRouter = process.env.AERODROME_ROUTER_ADDRESS;
+    if (aerodromeRouter && process.env.AERODROME_FACTORY_ADDRESS) {
         providers.push(new AerodromeDexProvider(
             provider, poolCache,
-            process.env.AERODROME_QUOTER_ADDRESS,
+            aerodromeRouter,
             process.env.AERODROME_FACTORY_ADDRESS
         ));
     }
@@ -126,9 +160,17 @@ function formatAmount(amount: bigint, addr: string): string {
     return Number(formatUnits(amount, getDecimals(addr))).toFixed(6);
 }
 
+function tokenAmountToNumber(amount: bigint, token: string): number {
+    return Number(formatUnits(amount, getDecimals(token)));
+}
+
+function percentageOf(numerator: bigint, denominator: bigint): number {
+    if (denominator <= 0n) return 0;
+    return Number((numerator * 1_000_000n) / denominator) / 10_000;
+}
+
 /** Convert a USD test amount into raw token units for `token`.
- *  Uses the WETH→USDC quote as the USD price reference for any non-stable token,
- *  so $1000 → the correct amount of WETH (≈0.53 WETH), not 1000 WETH.
+ *  Uses a token→USDC quote as the USD price reference for non-stable tokens.
  */
 async function usdToTokenAmount(usd: number, token: string): Promise<bigint> {
     const decimals = getDecimals(token);
@@ -148,25 +190,14 @@ async function usdToTokenAmount(usd: number, token: string): Promise<bigint> {
         return parseUnits(usd.toFixed(6), decimals);
     }
 
-    // Estimate price via WETH→USDC quote (best effort, cached 30s)
-    const weth = TOKENS.WETH;
-    const usdc = TOKENS.USDC;
-    let priceUSD = 1;
-    try {
-        const wethAmount = parseUnits("1", 18); // 1 WETH
-        const quote = await quoteOnRaw(weth, usdc, wethAmount);
-        if (quote && quote.amountOut > 0n) {
-            priceUSD = Number(quote.amountOut) / 1e6; // USDC 6dp
-        }
-    } catch { /* keep $1 fallback */ }
-
-    // For WETH itself, priceUSD is the ETH price (~$1900) → tiny amount. Good.
-    const tokenAmount = usd / priceUSD;
+    // Price each token directly against USDC.
+    const tokenAmount = usd / await tokenUsdPrice(token);
     return parseUnits(tokenAmount.toFixed(6), decimals);
 }
 
 // Raw quote helper (no DEX provider needed — use a direct quoter via a temporary provider)
 let _priceProvider: DexQuoteProvider | null = null;
+const _usdPriceCache = new Map<string, { price: number; expiresAt: number }>();
 async function quoteOnRaw(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<QuoteResult | null> {
     // Reuse the UniswapV3 provider as the price reference (deepest liquidity).
     if (!_priceProvider) {
@@ -178,6 +209,27 @@ async function quoteOnRaw(tokenIn: string, tokenOut: string, amountIn: bigint): 
         );
     }
     return _priceProvider.quote({ tokenIn, tokenOut, amountIn });
+}
+
+async function tokenUsdPrice(token: string): Promise<number> {
+    const stable = new Set([
+        TOKENS.USDC, TOKENS.USDT, TOKENS.DAI, TOKENS.USDe,
+        TOKENS.RLUSD, TOKENS.EURC, TOKENS.sUSDS
+    ].map(t => t.toLowerCase()));
+    const lower = token.toLowerCase();
+    if (stable.has(lower)) return 1;
+    const cached = _usdPriceCache.get(lower);
+    if (cached && cached.expiresAt > Date.now()) return cached.price;
+    const quote = await quoteOnRaw(token, TOKENS.USDC, parseUnits("1", getDecimals(token)));
+    if (!quote || quote.amountOut <= 0n) throw new Error(`No USD price available for ${token}`);
+    const price = Number(formatUnits(quote.amountOut, getDecimals(TOKENS.USDC)));
+    if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid USD price for ${token}`);
+    _usdPriceCache.set(lower, { price, expiresAt: Date.now() + 30_000 });
+    return price;
+}
+
+async function tokenAmountToUsd(amount: bigint, token: string): Promise<number> {
+    return Number(formatUnits(amount, getDecimals(token))) * await tokenUsdPrice(token);
 }
 
 /** Quote a single direction on one provider, returning amountOut (0 if unavailable). */
@@ -196,6 +248,22 @@ async function quoteOn(
     } catch {
         return null;
     }
+}
+
+function filterQuoteOutliers<T extends { q: QuoteResult }>(quotes: T[], label: string): T[] {
+    if (quotes.length < 3) return quotes;
+    const values = quotes.map(x => x.q.amountOut).sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+    const median = values[Math.floor(values.length / 2)];
+    if (!median || median <= 0n) return [];
+    const factor = BigInt(Math.ceil(MAX_QUOTE_DEVIATION_X * 1000));
+    const kept = quotes.filter(x => {
+        const out = x.q.amountOut;
+        return out * 1000n >= median * 1000n / factor && out * 1000n <= median * factor;
+    });
+    if (VERBOSE && kept.length !== quotes.length) {
+        console.log(`  [quote-filter] ${label}: removed ${quotes.length - kept.length} outlier quote(s), median=${median.toString()}, limit=${MAX_QUOTE_DEVIATION_X}x`);
+    }
+    return kept;
 }
 
 // ------------------------------------------------------------------
@@ -224,9 +292,12 @@ function resolveScanPairs(): { tokenA: string; tokenB: string }[] {
     if (WATCH_MODE === "all") {
         // Tier 1 + Tier 2 from TokenUniverse (21 tokens) → unique pairs.
         const tokenSet = new Set([...TIER_1_TOKENS, ...TIER_2_TOKENS].map(t => t.toLowerCase()));
-        const tokens = [...tokenSet];
+        const allTokens = [...tokenSet];
+        const tokens = WATCH_TOP_TOKENS > 0
+            ? allTokens.slice(0, WATCH_TOP_TOKENS)
+            : allTokens;
         const pairs = toUniquePairs(tokens);
-        console.log(`🧾 WATCH_MODE=all: ${tokens.length} tokens → ${pairs.length} candidate pairs (batch ${SCAN_BATCH_SIZE}, minLiquidity $${MIN_LIQUIDITY_USD}, minDex ${MIN_DEX_VARIETY})`);
+        console.log(`🧾 WATCH_MODE=all: ${tokens.length}/${allTokens.length} tokens → ${pairs.length} candidate pairs (batch ${SCAN_BATCH_SIZE}, minLiquidity $${MIN_LIQUIDITY_USD}, minDex ${MIN_DEX_VARIETY})`);
         return pairs;
     }
     // single (default)
@@ -246,6 +317,24 @@ async function scanAllPairs(
         maxPairsPerScan: MAX_PAIRS_PER_SCAN,
         poolCache
     });
+    console.log(`[SCAN] configured=${pairs.length}, eligible=${filtered.length}, mode=${WATCH_MODE}`);
+    if (filtered.length === 0) {
+        console.log("[SCAN] No pairs passed liquidity/DEX filter; waiting for pool refresh");
+    }
+    if (VERBOSE) {
+        const accepted = new Set(filtered.map(pair => `${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`));
+        for (const pair of pairs) {
+            const key = `${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`;
+            if (accepted.has(key)) continue;
+            const matches = poolCache.findPair(pair.tokenA, pair.tokenB);
+            const dexes = [...new Set(matches.map(pool => pool.dex))].join(",") || "none";
+            const liquidity = matches
+                .flatMap(pool => [pool.reserveUSD, pool.totalValueLockedUSD])
+                .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+            const maxLiquidity = liquidity.length > 0 ? Math.max(...liquidity) : 0;
+            console.log(`[FILTER] ${pair.tokenA.slice(0, 8)}↔${pair.tokenB.slice(0, 8)} rejected: pools=${matches.length}, dexes=${dexes}, maxLiquidity=$${maxLiquidity.toFixed(2)}, requiredDexes=${MIN_DEX_VARIETY}, requiredLiquidity=$${MIN_LIQUIDITY_USD}`);
+        }
+    }
     if (VERBOSE && filtered.length !== pairs.length) {
         console.log(`  🧹 Filter: ${pairs.length} → ${filtered.length} pair (liquidity/dex)`);
     }
@@ -268,13 +357,14 @@ async function scanAllPairs(
                         const qBuy = await quoteOn(dex, pair.tokenA, pair.tokenB, amountIn);
                         if (qBuy) buyQuotes.push({ dex: dex.getDexName(), q: qBuy });
                     }
-                    if (buyQuotes.length < 2) {
+                    const saneBuyQuotes = filterQuoteOutliers(buyQuotes, "buy");
+                    if (saneBuyQuotes.length < 2) {
                         return null;
                     }
 
                     // Best buy = highest amountOut of B for the same amountIn of A.
-                    buyQuotes.sort((a, b) => (a.q.amountOut > b.q.amountOut ? -1 : 1));
-                    const bestBuy = buyQuotes[0];
+                    saneBuyQuotes.sort((a, b) => (a.q.amountOut > b.q.amountOut ? -1 : 1));
+                    const bestBuy = saneBuyQuotes[0];
                     const buyAmountOut = bestBuy.q.amountOut;
 
                     // Phase 2: quote B→A on every DEX using the SAME buyAmountOut.
@@ -283,17 +373,17 @@ async function scanAllPairs(
                         const qSell = await quoteOn(dex, pair.tokenB, pair.tokenA, buyAmountOut);
                         if (qSell) sellQuotes.push({ dex: dex.getDexName(), q: qSell });
                     }
+                    const saneSellQuotes = filterQuoteOutliers(sellQuotes, "sell");
 
                     // Best round-trip: buy at bestBuy.dex, sell at the best cross-DEX.
                     let bestForPair: any = null;
-                    for (const sell of sellQuotes) {
+                    for (const sell of saneSellQuotes) {
                         if (sell.dex === bestBuy.dex) continue; // must be cross-DEX
                         const amountBack = sell.q.amountOut;
                         if (amountBack <= amountIn) continue;
                         const profit = amountBack - amountIn;
-                        const decimalsA = getDecimals(pair.tokenA);
-                        const profitUSD = Number(profit) / (10 ** decimalsA);
-                        const spreadPct = (Number(profit) / Number(amountIn)) * 100;
+                        const profitUSD = await tokenAmountToUsd(profit, pair.tokenA);
+                        const spreadPct = Number((profit * 1000000n) / amountIn) / 10000;
                         if (!bestForPair || profitUSD > bestForPair.netProfitUSD) {
                             bestForPair = {
                                 pair,
@@ -352,7 +442,12 @@ function buildOpportunity(
         fee: q.fee ?? 0,
         amountIn: amountInRaw,
         minAmountOut: minOut,
-        data: "0x",
+        data: q.dex === "AERODROME"
+            ? AbiCoder.defaultAbiCoder().encode(
+                ["bool", "address"],
+                [q.stable ?? false, q.factory ?? "0x0000000000000000000000000000000000000000"]
+            )
+            : "0x",
         deadline: Math.floor(Date.now() / 1000) + 60
     });
 
@@ -360,7 +455,8 @@ function buildOpportunity(
     const slip = (out: bigint) => (out * (1000n - BigInt(Math.round(SLIPPAGE_PCT * 10)))) / 1000n;
     const steps = [
         step(forward, amountIn, slip(forward.amountOut)),
-        step(reverse, forward.amountOut, slip(reverse.amountOut))
+        // Let ArbitrageEngineV2 use the actual output of the first leg.
+        step(reverse, 0n, slip(reverse.amountOut))
     ];
 
     return {
@@ -380,9 +476,17 @@ function buildOpportunity(
 // Main
 // ------------------------------------------------------------------
 async function main() {
+    const network = await provider.getNetwork();
+    if (network.chainId !== 8453n) {
+        throw new Error(`Wrong network: expected Base mainnet (8453), got ${network.chainId}`);
+    }
     console.log("🚀 Spread Monitor + Auto-Execute");
     console.log("=================================");
-    console.log(`Pair: ${WATCH_PAIR_A.slice(0,6)} ↔ ${WATCH_PAIR_B.slice(0,6)}`);
+    if (WATCH_MODE === "list") {
+        console.log(`Pairs: ${WATCH_PAIRS_CSV}`);
+    } else {
+        console.log(`Pair: ${WATCH_PAIR_A.slice(0,6)} ↔ ${WATCH_PAIR_B.slice(0,6)}`);
+    }
     console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: $${TEST_AMOUNT_USD} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms | Slippage: ${SLIPPAGE_PCT}%`);
     console.log(`Execution: ${ENABLE_EXECUTION ? "ENABLED" : "DISABLED (watch only)"}`);
     console.log(`Signer: ${wallet.address}`);
@@ -425,8 +529,7 @@ async function main() {
     }
 
     // Amount for monitoring (in token A units) — kept for single mode
-    const amountInSingle = await usdToTokenAmount(TEST_AMOUNT_USD, WATCH_PAIR_A);
-    console.log(`Single-pair monitoring amount: ${formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${TEST_AMOUNT_USD})\n`);
+    let amountInSingle: bigint;
 
     // Preload pool cache from subgraphs (lightweight GraphQL; avoids RPC rate limits) — enables MIN_DEX_VARIETY/MIN_LIQUIDITY filters.
     const SUBGRAPH_POOL_LIMIT_N = Number(process.env.SUBGRAPH_POOL_LIMIT || 20);
@@ -460,6 +563,43 @@ async function main() {
             triedDexes.push(name);
         }
 
+        // Always preload the WETH/USDC anchor pair used for USD sizing. The
+        // top-pools query may omit it when the configured limit is small.
+        if (process.env.UNISWAP_SUBGRAPH_URL) {
+            try {
+                await subgraphLoader.loadUniswapTokenPair(
+                    process.env.UNISWAP_SUBGRAPH_URL,
+                    TOKENS.WETH.toLowerCase(),
+                    TOKENS.USDC.toLowerCase()
+                );
+            } catch (e: any) {
+                if (VERBOSE) console.log(`  Uniswap anchor pair load failed (${e?.message || String(e)})`);
+            }
+        }
+
+        // Targeted mode must load the explicitly requested pairs even when
+        // they are absent from the subgraph's top-pools result.
+        if (WATCH_MODE === "list" && process.env.TARGETED_ALLOW_RPC_POOL_DISCOVERY === "true") {
+            const targetedPairs = resolveScanPairs();
+            const targetedFactories = [
+                ["UNISWAP", process.env.UNISWAP_FACTORY_ADDRESS],
+                ["SUSHISWAP", process.env.SUSHISWAP_FACTORY_ADDRESS],
+                ["PANCAKESWAP", process.env.PANCAKESWAP_FACTORY_ADDRESS],
+                ["AERODROME", process.env.AERODROME_FACTORY_ADDRESS]
+            ] as const;
+            const targetedLoader = new PoolLoader(provider, poolCache);
+            for (const pair of targetedPairs) {
+                for (const [dex, factory] of targetedFactories) {
+                    if (!factory) continue;
+                    try {
+                        await targetedLoader.loadPair(factory, dex, pair.tokenA, pair.tokenB);
+                    } catch (e: any) {
+                        if (VERBOSE) console.log(`  Targeted ${dex} pair load failed: ${e?.message || String(e)}`);
+                    }
+                }
+            }
+        }
+
         // 2) Factory RPC fallback for DEXes with no subgraph pools (uses WS/RPC rate limiter)
         if (POOL_RPC_FALLBACK) {
             const rpcLoader = new PoolLoader(provider, poolCache);
@@ -470,7 +610,10 @@ async function main() {
                 ["Aerodrome", process.env.AERODROME_FACTORY_ADDRESS],
             ] as const) {
                 if (!factoryAddr) continue;
-                if ((perDexCount[name] ?? 0) > 0) continue; // subgraph already provided
+                // Aerodrome subgraph entries use CL metadata and do not carry the
+                // V2 stable flag required by the router, so always load its V2
+                // pools from the factory.
+                if ((perDexCount[name] ?? 0) > 0 && name !== "Aerodrome") continue; // subgraph already provided
                 const before = poolCache.size();
                 try {
                     if (name === "Aerodrome") await rpcLoader.loadAerodrome(factoryAddr);
@@ -486,11 +629,19 @@ async function main() {
         }
 
         const loaded = triedDexes.filter(d => (perDexCount[d] ?? 0) > 0 || poolCache.getAll().some(p => p.dex.toLowerCase() === d.toLowerCase()));
+        const cachePools = poolCache.getAll();
+        const rpcReservePools = cachePools.filter(p => p.liquiditySource === "rpc" && p.reserve0Raw !== undefined && p.reserve1Raw !== undefined).length;
+        const usdLiquidityPools = cachePools.filter(p => Number.isFinite(p.reserveUSD) && (p.reserveUSD ?? 0) > 0).length;
+        console.log(`  Liquidity metadata: USD/TVL=${usdLiquidityPools}, RPC reserves=${rpcReservePools}, unknown=${cachePools.length - Math.max(usdLiquidityPools, rpcReservePools)}`);
         console.log(`  📦 PoolCache: ${poolCache.size()} pools (${triedDexes.map(d => `${d}=${perDexCount[d] ?? "rpc"}`).join(", ")})`);
     }
 
     await refreshPoolCache();
     console.log();
+    if (WATCH_MODE === "single") {
+        amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
+        console.log(`Single-pair monitoring amount: ${formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${EFFECTIVE_TEST_AMOUNT_USD})\n`);
+    }
 
     const scanPairs = resolveScanPairs();
 
@@ -508,7 +659,7 @@ async function main() {
             const key = token.toLowerCase();
             const cached = amountCache.get(key);
             if (cached) return cached;
-            const v = await usdToTokenAmount(TEST_AMOUNT_USD, token);
+            const v = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, token);
             amountCache.set(key, v);
             return v;
         };
@@ -564,7 +715,9 @@ async function main() {
                     continue;
                 }
             } catch (e: any) {
-                console.log(`  ⚠️ validateRoute failed (${e?.message || String(e)}) — continuing`);
+                console.log(`  ⚠️ validateRoute failed (${e?.message || String(e)}) — skipping execution`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
             }
 
             console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})…`);
@@ -587,17 +740,11 @@ async function main() {
         const amountIn = amountInSingle;
         // Quote token A -> token B (buy) on every DEX
         const buyQuotes: { dex: string; q: QuoteResult }[] = [];
-        const sellQuotes: { dex: string; q: QuoteResult }[] = [];
 
         for (const dex of dexProviders) {
             const qBuy = await quoteOn(dex, WATCH_PAIR_A, WATCH_PAIR_B, amountIn);
             if (qBuy) buyQuotes.push({ dex: dex.getDexName(), q: qBuy });
 
-            // Reverse direction: use the buy output as input for a fair comparison
-            if (qBuy && qBuy.amountOut > 0n) {
-                const qSell = await quoteOn(dex, WATCH_PAIR_B, WATCH_PAIR_A, qBuy.amountOut);
-                if (qSell) sellQuotes.push({ dex: dex.getDexName(), q: qSell });
-            }
         }
 
         if (VERBOSE) {
@@ -619,16 +766,18 @@ async function main() {
         // (In practice for monitoring, quoting both directions on each dex and comparing
         //  the implied rate is sufficient to detect large cross-DEX discrepancies.)
         for (const buy of buyQuotes) {
-            for (const sell of sellQuotes) {
-                if (buy.dex === sell.dex) continue; // Must be cross-DEX
+            for (const sellDex of dexProviders) {
+                if (buy.dex === sellDex.getDexName()) continue;
+                const sellQuote = await quoteOn(sellDex, WATCH_PAIR_B, WATCH_PAIR_A, buy.q.amountOut);
+                if (!sellQuote) continue;
+                const sell = { dex: sellDex.getDexName(), q: sellQuote };
 
                 const amountBack = sell.q.amountOut; // in token A
                 if (amountBack <= amountIn) continue;
 
                 const profit = amountBack - amountIn;
-                const decimalsA = getDecimals(WATCH_PAIR_A);
-                const profitUSD = Number(profit) / (10 ** decimalsA); // token A units → USD approximation
-                const spreadPct = (Number(profit) / Number(amountIn)) * 100;
+                const profitUSD = await tokenAmountToUsd(profit, WATCH_PAIR_A);
+                const spreadPct = Number((profit * 1000000n) / amountIn) / 10000;
 
                 if (VERBOSE) {
                     console.log(`  ${buy.dex}→${sell.dex}: ${formatAmount(amountBack, WATCH_PAIR_A)} back (${spreadPct.toFixed(3)}%)`);
@@ -686,7 +835,9 @@ async function main() {
                 continue;
             }
         } catch (e: any) {
-            console.log(`  ⚠️ validateRoute failed (${e?.message || String(e)}) — continuing`);
+            console.log(`  ⚠️ validateRoute failed (${e?.message || String(e)}) — skipping execution`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
         }
 
         console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})…`);

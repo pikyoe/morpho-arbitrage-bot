@@ -1,11 +1,12 @@
 import { setTimeout as sleep } from "timers/promises";
-import { JsonRpcProvider, Wallet, WebSocketProvider, ethers as ethersLib, parseUnits } from "ethers";
-import { TOKENS } from "../../bot/scanner/TokenList.js";
+import { JsonRpcProvider, Provider, Wallet, WebSocketProvider, ethers as ethersLib, formatUnits, parseUnits } from "ethers";
+import { TOKENS, TOKEN_DECIMALS } from "../../bot/scanner/TokenList.js";
 import { getActiveUniverse } from "../../bot/scanner/TokenUniverse.js";
-import { convertUSDToUSDC } from "../../bot/utils/USDAmountConverter.js";
+import { convertUSDToUSDC, convertUSDToTokenAmount, getTokenPriceUSD } from "../../bot/utils/USDAmountConverter.js";
 
 import { PoolCache } from "../../bot/scanner/PoolCache.js";
 import { SubgraphPoolLoader } from "../../bot/scanner/SubgraphPoolLoader.js";
+import { getMultiRPCManager } from "../../bot/utils/MultiRPCManager.js";
 import { RpcPoolLoader, createWebSocketProvider } from "../../bot/scanner/RpcPoolLoader.js";
 import { PoolStateCache } from "../../bot/scanner/state/PoolStateCache.js";
 import { UniswapPoolStateLoader } from "../../bot/scanner/state/UniswapPoolStateLoader.js";
@@ -34,7 +35,6 @@ import { DexQuoteProvider } from "../../bot/scanner/quote/DexQuoteProvider.js";
 import { DexProviderAdapter } from "../../bot/scanner/quote/DexProviderAdapter.js";
 import { AdapterRegistry } from "../../bot/registry/AdapterRegistry.js";
 import { RouteBuilder } from "../../bot/RouteBuilder.js";
-import { TOKENS, TOKEN_DECIMALS, parseUnits } from "../../bot/scanner/TokenList.js";
 import { PoolInfo } from "../../bot/scanner/PoolTypes.js";
 import { FlashLoanExecutor } from "../../bot/executor/FlashLoanExecutor.js";
 import { evaluateExecutionSafety } from "../../bot/executor/ExecutionGuard.js";
@@ -45,13 +45,11 @@ import { CircuitBreaker, CircuitBreakerConfig } from "../../bot/circuit/CircuitB
 import { ConfigValidator } from "../utils/ConfigValidator.js";
 import { getQuoteCache } from "../../bot/scanner/QuoteCache.js";
 import { RateLimiter, rpcRateLimiter, quoteRateLimiter, stateRateLimiter } from "../../bot/utils/RateLimiter.js";
-import { getMultiRPCManager } from "../../bot/utils/MultiRPCManager.js";
 import hre from "hardhat";
 
 // Caching and rate limiting configuration
 const ENABLE_CACHING = true;
 const ENABLE_RATE_LIMITING = true;
-const ENABLE_MULTI_RPC = true;
 const ENABLE_EVENT_BASED_SCANNING = true; // Set to true for WebSocket-based scanning
 const SCAN_INTERVAL_MS = 60000; // 60 seconds for production to prevent API rate limits
 const MAX_POOLS = 200; // Increased from 20 to allow more triangle discovery
@@ -61,6 +59,9 @@ const MIN_LIQUIDITY_ETH = 5; // Skip pools with liquidity below threshold
 const MAX_PRICE_IMPACT = 0.015; // Maximum acceptable price impact fraction (1.5%)
 const MIN_NET_PROFIT_USD = 1; // Reduced from 5 to 1 for more opportunities
 const MIN_GROSS_PROFIT_USD = 5; // Reduced from 10 to 5 for more opportunities
+const EXECUTION_GAS_RESERVE_USD = Number(process.env.EXECUTION_GAS_RESERVE_USD || 0.5);
+const DRY_RUN = process.env.RUNBOT_DRY_RUN === "true";
+const ENABLE_MULTI_RPC = true;
 const MAX_LOAN_USD = 10000; // Cap exposure per trade
 const MAX_QUOTE_AGE_MS = 10000; // Reject stale quotes older than 10s
 
@@ -71,11 +72,101 @@ const TEST_AMOUNTS_USD = [500]; // $500 USD for discovery
 
 // Convert USD to USDC amount for discovery
 const TEST_AMOUNTS = TEST_AMOUNTS_USD.map(amount => convertUSDToUSDC(amount));
+const SWAP_STEP_TUPLE = "(address adapter,address tokenIn,address tokenOut,uint24 fee,uint256 amountIn,uint256 minAmountOut,bytes data,uint256 deadline)";
+const ROUTE_TUPLE = `(${SWAP_STEP_TUPLE}[] swaps,address profitToken,uint256 minProfit)`;
+const EXECUTE_ARBITRAGE_ABI = [
+    `function executeArbitrage(address token,uint256 amount,${ROUTE_TUPLE} route)`,
+    `function validateRoute(${ROUTE_TUPLE} route,address token) view returns (bool)`,
+    "function approvedAdapter(address) view returns (bool)"
+];
 
 function getPoolPairKey(pool: PoolInfo): string {
     const tokens = [pool.token0.toLowerCase(), pool.token1.toLowerCase()];
     tokens.sort();
     return `${tokens[0]}-${tokens[1]}`;
+}
+
+function rawTokenAmountToUsd(amount: bigint, token: string): number {
+    const decimals = TOKEN_DECIMALS[token.toLowerCase()] || 18;
+    return Number(formatUnits(amount, decimals)) * getTokenPriceUSD(token);
+}
+
+function enrichTriangleOpportunity(opp: any): any {
+    const token = String(opp.route?.tokenA || opp.steps?.[0]?.from || TOKENS.USDC);
+    const inputAmount = BigInt(opp.inputAmount ?? opp.steps?.[0]?.amountIn ?? 0);
+    const rawProfit = BigInt(opp.profit ?? (BigInt(opp.outputAmount ?? 0) - inputAmount));
+    const loanAmountUSD = rawTokenAmountToUsd(inputAmount, token);
+    const grossProfitUSD = rawTokenAmountToUsd(rawProfit > 0n ? rawProfit : 0n, token);
+    const netProfitUSD = grossProfitUSD - EXECUTION_GAS_RESERVE_USD;
+    const quoteTimestamp = Number(opp.quoteTimestamp ?? Date.now());
+    return {
+        ...opp,
+        loanAmountUSD,
+        grossProfitUSD,
+        netProfitUSD,
+        gasRatio: grossProfitUSD > 0 ? EXECUTION_GAS_RESERVE_USD / grossProfitUSD : Infinity,
+        quoteTimestamp,
+        quoteAgeMs: Math.max(0, Date.now() - quoteTimestamp),
+        gasCostUSD: EXECUTION_GAS_RESERVE_USD,
+        flashLoanFeeUSD: 0
+    };
+}
+
+async function refreshTriangleOpportunity(opp: any): Promise<any | null> {
+    if (!Array.isArray(opp.steps) || opp.steps.some((s: any) => !s.provider)) return null;
+    let amount = BigInt(opp.inputAmount);
+    const refreshedSteps: any[] = [];
+    for (const step of opp.steps) {
+        const quote = await step.provider.quote({ tokenIn: step.from, tokenOut: step.to, amountIn: amount });
+        if (!quote || quote.amountOut <= 0n) return null;
+        refreshedSteps.push({
+            ...step,
+            // ArbitrageEngineV2 uses currentAmount when amountIn is zero.
+            // Only the flash-loan leg should be pinned to a fixed amount;
+            // later legs must consume the previous leg's actual output.
+            amountIn: refreshedSteps.length === 0 ? amount : 0n,
+            amountOut: quote.amountOut,
+            minAmountOut: (quote.amountOut * 9950n) / 10000n
+        });
+        amount = quote.amountOut;
+    }
+    const refreshed = {
+        ...opp,
+        steps: refreshedSteps,
+        outputAmount: amount,
+        profit: amount - BigInt(opp.inputAmount),
+        quoteTimestamp: Date.now()
+    };
+    return enrichTriangleOpportunity(refreshed);
+}
+
+async function applyDynamicGasCost(opp: any): Promise<any> {
+    try {
+        const gasPrice = await priceOracle.getGasPrice();
+        const ethPriceUSD = await priceOracle.getEthPriceUSD();
+        // Estimate the actual route. A fixed gas limit can materially
+        // understate costs for multi-hop routes and create false positives.
+        const gasLimit = await flashLoanExecutor.estimateOpportunityGas(opp, opp.profitToken);
+        const gasCostUSD = Number(gasPrice * gasLimit) / 1e18 * ethPriceUSD;
+        const gross = opp.grossProfitUSD;
+        return {
+            ...opp,
+            netProfitUSD: gross - gasCostUSD,
+            gasCostUSD,
+            gasLimit: gasLimit.toString(),
+            gasRatio: gross > 0 ? gasCostUSD / gross : Infinity
+        };
+    } catch {
+        // Do not execute on an unpriced route. Returning -Infinity lets the
+        // normal opportunity/safety filters reject it without a transaction.
+        return {
+            ...opp,
+            netProfitUSD: Number.NEGATIVE_INFINITY,
+            gasCostUSD: Number.POSITIVE_INFINITY,
+            gasRatio: Number.POSITIVE_INFINITY,
+            gasEstimationFailed: true
+        };
+    }
 }
 
 function filterMultiDexPairs(pools: PoolInfo[]): PoolInfo[] {
@@ -96,7 +187,7 @@ function filterMultiDexPairs(pools: PoolInfo[]): PoolInfo[] {
 }
 
 // Global service declarations (uninitialized)
-let provider: JsonRpcProvider;
+let provider: Provider;
 let signer: Wallet;
 let poolCache: PoolCache;
 let stateCache: PoolStateCache;
@@ -153,8 +244,22 @@ async function main() {
         throw new Error("BASE_RPC_URL not set in environment");
     }
 
-    // Initialize providers
-    httpProvider = new JsonRpcProvider(BASE_RPC_URL);
+    // Initialize HTTP providers. Use both configured RPC endpoints through a
+    // fallback provider instead of sending every request to BASE_RPC_URL only.
+    const rpcUrls = [...new Set([
+        process.env.BASE_RPC_URL_1 || BASE_RPC_URL,
+        process.env.BASE_RPC_URL_2
+    ].filter((url): url is string => Boolean(url)))];
+    const rpcProviders = rpcUrls.map(url => new JsonRpcProvider(url));
+    httpProvider = rpcProviders[0];
+    const httpFallbackProvider = rpcProviders.length > 1
+        ? new ethersLib.FallbackProvider(rpcProviders.map((rpc, index) => ({
+            provider: rpc,
+            priority: index + 1,
+            stallTimeout: 1500,
+            weight: 1
+        })))
+        : httpProvider;
     if (WS_RPC_URL && ENABLE_EVENT_BASED_SCANNING) {
         try {
             wsProvider = new WebSocketProvider(WS_RPC_URL);
@@ -166,8 +271,11 @@ async function main() {
         }
     }
 
-    provider = wsProvider || httpProvider;
+    // WebSocket is reserved for event subscriptions; all HTTP reads, quotes,
+    // gas estimation and execution use the configured fallback RPC set.
+    provider = httpFallbackProvider;
     signer = new Wallet(PRIVATE_KEY, provider);
+    console.log(`HTTP RPC endpoints active: ${rpcUrls.join(", ")}`);
 
     console.log(`✅ Provider initialized: ${wsProvider ? "WebSocket" : "HTTP"}`);
     console.log(`✅ Signer: ${signer.address}\n`);
@@ -185,7 +293,7 @@ async function main() {
 
     // Initialize hybrid pool loaders (Subgraph for Uniswap, RPC for others)
     subgraphPoolLoader = new SubgraphPoolLoader(poolCache);
-    const factoryProvider = new JsonRpcProvider(BASE_RPC_URL);
+    const factoryProvider: Provider = httpFallbackProvider;
     
     // Get active universe tokens for RPC pool loaders
     const activeUniverseTokens = getActiveUniverse().tokens;
@@ -252,7 +360,14 @@ async function main() {
     // Limit pools
     const allPools = poolCache.getAll();
     // Skip multi-DEX filter for triangle discovery to allow more opportunities
-    const limitedPools = allPools.slice(0, MAX_POOLS);
+    const limitedPools = allPools
+        .slice()
+        .sort((a, b) => {
+            const liquidityA = a.totalValueLockedUSD ?? a.reserveUSD ?? 0;
+            const liquidityB = b.totalValueLockedUSD ?? b.reserveUSD ?? 0;
+            return liquidityB - liquidityA;
+        })
+        .slice(0, MAX_POOLS);
 
     poolCache.clear();
     for (const pool of limitedPools) {
@@ -305,17 +420,39 @@ async function main() {
     }
     
     // Aerodrome provider - ENABLED with subgraph for pool discovery
-    if (process.env.AERODROME_QUOTER_ADDRESS && process.env.AERODROME_FACTORY_ADDRESS) {
+    const aerodromeRouter = process.env.AERODROME_ROUTER_ADDRESS || process.env.AERODROME_ROUTER;
+    if (aerodromeRouter && process.env.AERODROME_FACTORY_ADDRESS) {
         const aerodromeProvider = new AerodromeDexProvider(
             provider,
             poolCache,
-            process.env.AERODROME_QUOTER_ADDRESS,
+            aerodromeRouter,
             process.env.AERODROME_FACTORY_ADDRESS
         );
         dexProviders.push(aerodromeProvider);
         console.log("✅ Aerodrome DEX provider initialized with subgraph for pool discovery");
     }
     
+    // Discovery must only use DEXes that have a deployed, engine-approved
+    // adapter. A quote from a DEX without an adapter can never be executed
+    // safely and would otherwise create false opportunities.
+    const adapterEnvByDex: Record<string, string | undefined> = {
+        UniswapV3: process.env.UNISWAP_ADAPTER_V2_ADDRESS,
+        SushiSwap: process.env.SUSHISWAP_ADAPTER_V2_ADDRESS,
+        PancakeSwap: process.env.PANCAKESWAP_ADAPTER_V2_ADDRESS,
+        Aerodrome: process.env.AERODROME_ADAPTER_V2_ADDRESS
+    };
+    for (let i = dexProviders.length - 1; i >= 0; i--) {
+        const dexName = dexProviders[i].getDexName();
+        const adapterAddress = adapterEnvByDex[dexName];
+        if (!adapterAddress || !ethersLib.isAddress(adapterAddress) || adapterAddress === ethersLib.ZeroAddress) {
+            console.warn(`DEX provider disabled: ${dexName} has no valid adapter address`);
+            dexProviders.splice(i, 1);
+        }
+    }
+    if (dexProviders.length < 2) {
+        throw new Error("At least two DEX providers with valid deployed adapters are required");
+    }
+
     // Initialize hybrid aggregator (0x primary, 1inch fallback) - DISABLED for now
     // Only initialize if 0x API credentials are provided
     let zeroXAggregator: ZeroXAggregator | null = null;
@@ -348,7 +485,8 @@ async function main() {
         discrepancyEngine = new DiscrepancyDiscoveryEngine(
             dexProviders,
             poolCache,
-            0.002 // 0.2% minimum spread
+            0.002, // 0.2% minimum spread
+            provider
         );
         console.log("✅ Discrepancy discovery engine initialized");
     }
@@ -524,10 +662,11 @@ async function main() {
 
     // Initialize opportunity filter
     const filterConfig: FilterConfig = {
-        minNetProfitUSD: 1.0,           // Minimum $1 net profit for more opportunities
+        minNetProfitUSD: MIN_NET_PROFIT_USD,
+        minGrossProfitUSD: MIN_GROSS_PROFIT_USD,
         maxGasRatio: 0.5,               // Gas max 50% of gross profit
         minROI: 0.005,                  // Minimum 0.5% ROI (reduced from 1%)
-        minLoanUSD: 100.0               // Minimum $100 loan size
+        minLoanUSD: 100.0
     };
 
     opportunityFilter = new OpportunityFilter(filterConfig);
@@ -543,15 +682,6 @@ async function main() {
 
     circuitBreaker = new CircuitBreaker(circuitBreakerConfig);
 
-    // Initialize flash loan executor
-    flashLoanExecutor = new FlashLoanExecutor(
-        signer,
-        poolCache,
-        quoteEngine,
-        priceOracle,
-        TEST_AMOUNTS
-    );
-
     // Initialize adapter registry
     adapterRegistry = new AdapterRegistry(
         process.env.UNISWAP_ADAPTER_V2_ADDRESS || "",
@@ -560,8 +690,28 @@ async function main() {
         process.env.AERODROME_ADAPTER_V2_ADDRESS || ""
     );
 
+    // Initialize the V2 executor with the deployed engine contract. The old
+    // runBot constructor signature was incompatible with FlashLoanExecutor.
+    const engineAddress = process.env.ARBITRAGE_ENGINE_V2_ADDRESS;
+    if (!engineAddress) {
+        throw new Error("ARBITRAGE_ENGINE_V2_ADDRESS not set; refusing to run execution loop");
+    }
+    engine = new ethersLib.Contract(engineAddress, EXECUTE_ARBITRAGE_ABI, signer);
+    flashLoanExecutor = new FlashLoanExecutor(engine, adapterRegistry);
+
+    // Confirm every adapter used for discovery is approved by the deployed
+    // engine before scanning. This avoids discovering routes that can never
+    // pass on-chain validation.
+    for (const dex of dexProviders) {
+        const adapterAddress = adapterRegistry.get(dex.getDexName());
+        if (!await engine.approvedAdapter(adapterAddress)) {
+            throw new Error(`Adapter ${adapterAddress} for ${dex.getDexName()} is not approved by the engine`);
+        }
+    }
+
     // Main scanning loop
     console.log("Starting main scanning loop...\n");
+    console.log(`Execution mode: ${DRY_RUN ? "DRY-RUN (no transactions)" : "LIVE"}`);
 
     while (running) {
         loopCount++;
@@ -597,18 +747,32 @@ async function main() {
                     }
 
                     // Execute safety checks
-                    const safetyCheck = await evaluateExecutionSafety(opp, TEST_AMOUNTS);
-                    if (!safetyCheck.safe) {
+                    const safetyCheck = evaluateExecutionSafety({
+                        grossProfitUSD: opp.grossProfitUSD,
+                        netProfitUSD: opp.netProfitUSD,
+                        loanAmountUSD: opp.loanAmountUSD,
+                        quoteAgeMs: opp.quoteAgeMs,
+                        maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
+                        minNetProfitUSD: MIN_NET_PROFIT_USD,
+                        minGrossProfitUSD: MIN_GROSS_PROFIT_USD,
+                        maxLoanUSD: MAX_LOAN_USD
+                    });
+                    if (!safetyCheck.allowed) {
                         console.log(`⚠️ Safety check failed: ${safetyCheck.reason}`);
                         continue;
                     }
 
                     // Execute flash loan
                     try {
+                        if (DRY_RUN) {
+                            console.log("  🧪 Dry-run: route validated; transaction not submitted");
+                            continue;
+                        }
                         const result = await flashLoanExecutor.executeFlashLoan(opp);
                         
                         if (result.success) {
-                            console.log(`✅ Flash loan executed successfully: ${result.netProfitUSD.toFixed(2)} USD`);
+                            console.log(`✅ Flash loan executed successfully: ${(result.netProfitUSD ?? 0).toFixed(2)} USD`);
+                            console.log(`  Profit event: ${result.profitVerified ? `${result.actualProfitRaw?.toString()} raw units` : "not found"}`);
                             circuitBreaker.recordSuccess();
                         } else {
                             console.log(`❌ Flash loan execution failed: ${result.error}`);
@@ -697,10 +861,21 @@ async function main() {
                         TEST_AMOUNTS[0]
                     );
 
+                    let testAmountWETH: bigint;
+                    try {
+                        const ethPriceUSD = await priceOracle.getEthPriceUSD();
+                        testAmountWETH = parseUnits(
+                            (TEST_AMOUNTS_USD[0] / ethPriceUSD).toFixed(6),
+                            18
+                        );
+                    } catch {
+                        // Keep the static converter only as a sizing fallback.
+                        testAmountWETH = convertUSDToTokenAmount(TEST_AMOUNTS_USD[0], TOKENS.WETH);
+                    }
                     const trianglesFromWETH = await discrepancyEngine.formTrianglesFromEdges(
                         edges,
                         TOKENS.WETH,
-                        TEST_AMOUNTS[0]
+                        testAmountWETH
                     );
 
                     // Combine triangles from both anchors
@@ -708,7 +883,7 @@ async function main() {
                     console.log(`[MAIN SCAN] Total triangles from both anchors: ${triangles.length} (USDC: ${trianglesFromUSDC.length}, WETH: ${trianglesFromWETH.length})`);
 
                     // Convert TriangleCandidate to TriangularOpportunity format
-                    triangularOpps = triangles.map(triangle => ({
+                    triangularOpps = triangles.map(triangle => enrichTriangleOpportunity({
                         route: {
                             tokenA: triangle.tokenA,
                             tokenB: triangle.tokenB,
@@ -720,19 +895,32 @@ async function main() {
                             pool: leg.dexProvider ? (leg.dexProvider as any).quoter?.target || "" : "",
                             tokenIn: leg.from,
                             tokenOut: leg.to,
+                            fee: leg.fee,
+                            stable: leg.stable,
+                            factory: leg.factory,
                             amountIn: leg.amountIn,
                             amountOut: leg.amountOut
                         })),
                         inputAmount: triangle.inputAmount,
                         outputAmount: triangle.outputAmount,
                         profit: triangle.rawProfit,
+                        profitToken: triangle.tokenA,
                         profitPercentage: triangle.rawProfitPercentage,
-                        steps: triangle.legs.map(leg => ({
+                        steps: triangle.legs.map((leg, index) => ({
                             from: leg.from,
                             to: leg.to,
-                            amountIn: leg.amountIn,
+                            amountIn: index === 0 ? leg.amountIn : 0n,
                             amountOut: leg.amountOut,
-                            dex: leg.dex
+                            minAmountOut: (leg.amountOut * 9950n) / 10000n,
+                            dex: leg.dex,
+                            fee: leg.fee,
+                            data: leg.dex.toUpperCase() === "AERODROME"
+                                ? ethersLib.AbiCoder.defaultAbiCoder().encode(
+                                    ["bool", "address"],
+                                    [leg.stable ?? false, leg.factory ?? ethersLib.ZeroAddress]
+                                )
+                                : "0x"
+                            , provider: leg.dexProvider
                         })),
                         qualityMetrics: triangle.qualityMetrics
                     }));
@@ -740,11 +928,13 @@ async function main() {
                     console.log(`[MAIN SCAN] Two-phase discovery found ${triangularOpps.length} opportunities`);
                 } catch (error) {
                     console.log(`[MAIN SCAN] Two-phase discovery failed, falling back to traditional scan: ${error instanceof Error ? error.message : error}`);
-                    triangularOpps = await triangularScanner.scanTriangularOpportunities(0.001);
+                    triangularOpps = (await triangularScanner.scanTriangularOpportunities(0.001))
+                        .map(enrichTriangleOpportunity);
                 }
             } else {
                 // Fallback to traditional scan
-                triangularOpps = await triangularScanner.scanTriangularOpportunities(0.001);
+                triangularOpps = (await triangularScanner.scanTriangularOpportunities(0.001))
+                    .map(enrichTriangleOpportunity);
             }
 
             console.log(`[MAIN SCAN] Total opportunities: ${triangularOpps.length}`);
@@ -752,7 +942,17 @@ async function main() {
             if (triangularOpps.length > 0) {
                 console.log(`🎯 Found ${triangularOpps.length} triangular opportunities in loop ${loopCount}`);
                 
-                for (const opp of triangularOpps) {
+                for (const candidate of triangularOpps) {
+                    const refreshed = await refreshTriangleOpportunity(candidate);
+                    const opp = refreshed ? await applyDynamicGasCost(refreshed) : null;
+                    if (!opp) {
+                        console.log("  ⚠️ Candidate invalidated by fresh quotes");
+                        continue;
+                    }
+                    if (opp.gasEstimationFailed) {
+                        console.log("  ⚠️ Gas estimation failed; skipping execution");
+                        continue;
+                    }
                     console.log(`  ${opp.route.routeName}: ${opp.profitPercentage.toFixed(2)}% profit`);
                     
                     // Apply opportunity filter
@@ -770,18 +970,42 @@ async function main() {
                     console.log(`  ℹ️  0x validation disabled, skipping`);
 
                     // Execute safety checks
-                    const safetyCheck = await evaluateExecutionSafety(opp, TEST_AMOUNTS);
-                    if (!safetyCheck.safe) {
+                    const safetyCheck = evaluateExecutionSafety({
+                        grossProfitUSD: opp.grossProfitUSD,
+                        netProfitUSD: opp.netProfitUSD,
+                        loanAmountUSD: opp.loanAmountUSD,
+                        quoteAgeMs: opp.quoteAgeMs,
+                        maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
+                        minNetProfitUSD: MIN_NET_PROFIT_USD,
+                        minGrossProfitUSD: MIN_GROSS_PROFIT_USD,
+                        maxLoanUSD: MAX_LOAN_USD
+                    });
+                    if (!safetyCheck.allowed) {
                         console.log(`  ⚠️ Safety check failed: ${safetyCheck.reason}`);
+                        continue;
+                    }
+
+                    try {
+                        if (!await flashLoanExecutor.validateOpportunity(opp, opp.profitToken)) {
+                            console.log("  âš ï¸ On-chain route validation failed");
+                            continue;
+                        }
+                    } catch (error) {
+                        console.log(`  âš ï¸ On-chain route validation error: ${error instanceof Error ? error.message : error}`);
                         continue;
                     }
 
                     // Execute flash loan for triangular arbitrage
                     try {
+                        if (DRY_RUN) {
+                            console.log("  🧪 Dry-run: triangular route validated; transaction not submitted");
+                            continue;
+                        }
                         const result = await flashLoanExecutor.executeFlashLoan(opp);
                         
                         if (result.success) {
-                            console.log(`  ✅ Triangular flash loan executed successfully: ${result.netProfitUSD.toFixed(2)} USD`);
+                            console.log(`  ✅ Triangular flash loan executed successfully: ${(result.netProfitUSD ?? 0).toFixed(2)} USD`);
+                            console.log(`  Profit event: ${result.profitVerified ? `${result.actualProfitRaw?.toString()} raw units` : "not found"}`);
                             circuitBreaker.recordSuccess();
                         } else {
                             console.log(`  ❌ Triangular flash loan execution failed: ${result.error}`);
@@ -835,3 +1059,4 @@ process.on("SIGTERM", () => {
 });
 
 main().catch(console.error);
+
