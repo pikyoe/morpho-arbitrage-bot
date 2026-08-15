@@ -7,6 +7,7 @@ import {
     QuoteResult,
     IQuoteProvider
 } from "./index.js";
+import { rpcRateLimiter } from "../../utils/RateLimiter.js";
 
 import { AERODROME_ROUTER_ABI } from "../abis/AerodromeRouter.js";
 
@@ -112,6 +113,8 @@ export class AerodromeQuote
     for (const pool of pools) {
 
     try {
+
+        await rpcRateLimiter.wait();
 
         const routes = [
 

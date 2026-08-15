@@ -24,6 +24,12 @@ const STABLES = [
 
 ];
 
+const AERODROME_POOL_ABI = [
+    "function token0() view returns (address)",
+    "function token1() view returns (address)",
+    "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"
+];
+
 export class PoolLoader {
 
     constructor(
@@ -33,6 +39,68 @@ export class PoolLoader {
         private readonly cache: PoolCache
 
     ) {}
+
+    /** Load only one configured pair from a V3-style or Aerodrome factory. */
+    async loadPair(factoryAddress: string, dexName: string, tokenA: string, tokenB: string): Promise<void> {
+        const a = this.norm(tokenA);
+        const b = this.norm(tokenB);
+        if (!a || !b) return;
+        const factory = new Contract(
+            factoryAddress,
+            dexName.toUpperCase() === "AERODROME"
+                ? AERODROME_FACTORY_ABI
+                : UNISWAP_FACTORY_ABI,
+            this.provider
+        );
+        if (dexName.toUpperCase() === "AERODROME") {
+            for (const stable of STABLES) {
+                await rpcRateLimiter.wait();
+                const pool = await factory.getPool(a, b, stable);
+                if (pool && pool !== ethers.ZeroAddress) {
+                    this.cache.add(await this.aerodromePoolInfo(pool, a, b, stable, factoryAddress));
+                }
+            }
+            return;
+        }
+        for (const fee of FEES) {
+            await rpcRateLimiter.wait();
+            const pool = await factory.getPool(a, b, fee);
+            if (pool && pool !== ethers.ZeroAddress) {
+                this.cache.add({ dex: dexName.toUpperCase() as any, pool, token0: a, token1: b, fee });
+            }
+        }
+    }
+
+    /** Read V2 reserve state without pretending raw reserves are USD. */
+    private async aerodromePoolInfo(
+        pool: string,
+        tokenA: string,
+        tokenB: string,
+        stable: boolean,
+        factory: string
+    ): Promise<any> {
+        const base = { dex: "AERODROME", pool, token0: tokenA, token1: tokenB, stable, factory };
+        try {
+            const contract = new Contract(pool, AERODROME_POOL_ABI, this.provider);
+            const [token0, token1, reserves, block] = await Promise.all([
+                contract.token0(),
+                contract.token1(),
+                contract.getReserves(),
+                this.provider.getBlockNumber()
+            ]);
+            return {
+                ...base,
+                token0,
+                token1,
+                reserve0Raw: reserves[0].toString(),
+                reserve1Raw: reserves[1].toString(),
+                liquiditySource: "rpc",
+                liquidityUpdatedBlock: Number(block)
+            };
+        } catch {
+            return { ...base, liquiditySource: "unknown" };
+        }
+    }
 
     /** Normalize an address: lowercase first so any casing is accepted, then
      *  ethers computes the correct EIP-55 checksum. Returns null only when the
@@ -154,21 +222,7 @@ export class PoolLoader {
                         continue;
                     }
 
-                    this.cache.add({
-
-                        dex: "AERODROME",
-
-                        pool,
-
-                        token0: tokenA,
-
-                        token1: tokenB,
-
-                        stable,
-
-                        factory: factoryAddress
-
-                    });
+                    this.cache.add(await this.aerodromePoolInfo(pool, tokenA, tokenB, stable, factoryAddress));
 
                 }
 

@@ -5,6 +5,7 @@ export interface BlockEventScannerConfig {
     enabled: boolean;
     onBlock?: (blockNumber: number) => Promise<void>;
     onError?: (error: Error) => void;
+    skipBlocks?: number; // Skip N blocks between scans to reduce load (0 = every block)
 }
 
 export class BlockEventScanner {
@@ -13,6 +14,10 @@ export class BlockEventScanner {
     private config: BlockEventScannerConfig;
     private isRunning: boolean = false;
     private blockListener: ((blockNumber: number) => void) | null = null;
+    private blockCount: number = 0;
+    private processedBlockCount: number = 0;
+    private startTime: number = 0;
+    private lastBlockTime: number = 0;
 
     constructor(
         provider: ethers.Provider,
@@ -36,12 +41,29 @@ export class BlockEventScanner {
         }
 
         this.isRunning = true;
+        this.blockCount = 0;
+        this.startTime = Date.now();
         console.log("Starting block event scanner...");
+        console.log("Mode: Real-time WebSocket-based block monitoring");
 
         // Set up block listener
         this.blockListener = async (blockNumber: number) => {
             try {
-                console.log(`New block: ${blockNumber}`);
+                this.blockCount++;
+                this.lastBlockTime = Date.now();
+                const elapsed = this.lastBlockTime - this.startTime;
+                const blocksPerMinute = (this.blockCount / (elapsed / 60000)).toFixed(2);
+                
+                const skipBlocks = this.config.skipBlocks || 0;
+                
+                // Skip blocks if configured
+                if (skipBlocks > 0 && this.blockCount % (skipBlocks + 1) !== 0) {
+                    console.log(`🔔 New block: ${blockNumber} (skipped - Total: ${this.blockCount}, Rate: ${blocksPerMinute}/min)`);
+                    return;
+                }
+                
+                this.processedBlockCount++;
+                console.log(`🔔 New block: ${blockNumber} (Processing - Total: ${this.blockCount}, Processed: ${this.processedBlockCount}, Rate: ${blocksPerMinute}/min)`);
                 
                 // Execute the scan on new block
                 if (this.config.onBlock) {
@@ -61,7 +83,8 @@ export class BlockEventScanner {
 
         // Subscribe to new blocks
         this.provider.on('block', this.blockListener);
-        console.log("Subscribed to block events");
+        console.log("✅ Subscribed to block events");
+        console.log("📊 Monitoring for arbitrage opportunities in real-time...");
     }
 
     async stop(): Promise<void> {
@@ -77,6 +100,16 @@ export class BlockEventScanner {
             this.blockListener = null;
         }
 
+        // Log statistics
+        const elapsed = Date.now() - this.startTime;
+        const blocksPerMinute = (this.blockCount / (elapsed / 60000)).toFixed(2);
+        const processedPerMinute = (this.processedBlockCount / (elapsed / 60000)).toFixed(2);
+        console.log("\n📊 Block Event Scanner Statistics:");
+        console.log(`  Total blocks received: ${this.blockCount}`);
+        console.log(`  Total blocks processed: ${this.processedBlockCount}`);
+        console.log(`  Runtime: ${(elapsed / 1000).toFixed(2)} seconds`);
+        console.log(`  Average block rate: ${blocksPerMinute}/min`);
+        console.log(`  Average processed rate: ${processedPerMinute}/min`);
         console.log("Block event scanner stopped");
     }
 

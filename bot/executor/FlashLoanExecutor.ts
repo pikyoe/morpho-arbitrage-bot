@@ -11,8 +11,16 @@ export interface FlashLoanResult {
     success: boolean;
     txHash?: string;
     netProfitUSD?: number;
+    actualProfitRaw?: bigint;
+    gasUsed?: bigint;
+    gasCostWei?: bigint;
+    profitVerified?: boolean;
     error?: string;
 }
+
+const ENGINE_EVENTS = new ethers.Interface([
+    "event ArbitrageFinished(uint256 profit)"
+]);
 
 /**
  * SwapStep as expected by the deployed ArbitrageEngineV2 route struct:
@@ -53,7 +61,7 @@ function normalizeRoute(opp: any): Route {
 
     // Legacy flat format: opp.steps = [{ adapter, tokenIn, tokenOut, fee, amountIn, amountOut, dex, ... }]
     if (opp?.steps && Array.isArray(opp.steps) && opp.steps.length > 0) {
-        const profitToken = opp.route?.profitToken || opp.steps[0]?.to || opp.steps[0]?.tokenOut;
+        const profitToken = opp.route?.profitToken || opp.profitToken || opp.steps[opp.steps.length - 1]?.to || opp.steps[opp.steps.length - 1]?.tokenOut;
         const lastStep = opp.steps[opp.steps.length - 1];
         const inputIsProfitToken =
             profitToken.toLowerCase() === String(opp?.steps?.[0]?.from || opp?.steps?.[0]?.tokenIn || "").toLowerCase();
@@ -64,7 +72,7 @@ function normalizeRoute(opp: any): Route {
             tokenOut: s.tokenOut || s.to,
             fee: Number(s.fee ?? 0),
             amountIn: BigInt(s.amountIn ?? s.amount),
-            minAmountOut: BigInt(s.amountOut ?? 0),
+            minAmountOut: BigInt(s.minAmountOut ?? s.amountOut ?? 0),
             data: s.data || "0x",
             deadline: Number(s.deadline ?? (Math.floor(Date.now() / 1000) + 60))
         }));
@@ -93,6 +101,33 @@ export class FlashLoanExecutor {
         /** Optional registry used to resolve DEX names → adapter addresses. */
         private readonly registry?: any
     ) {}
+
+    async validateOpportunity(opp: any, token?: string): Promise<boolean> {
+        const route = this.resolveRoute(normalizeRoute(opp));
+        const tokenIn = token || route.profitToken || route.swaps[0]?.tokenIn;
+        if (!tokenIn || !this.engine.validateRoute) return false;
+        if (route.swaps.length < 2 ||
+            route.swaps[0].tokenIn.toLowerCase() !== tokenIn.toLowerCase() ||
+            route.swaps[route.swaps.length - 1].tokenOut.toLowerCase() !== tokenIn.toLowerCase() ||
+            route.profitToken.toLowerCase() !== tokenIn.toLowerCase()) {
+            return false;
+        }
+        return Boolean(await this.engine.validateRoute(route, tokenIn));
+    }
+
+    async estimateOpportunityGas(opp: any, token?: string): Promise<bigint> {
+        const route = this.resolveRoute(normalizeRoute(opp));
+        const tokenIn = token || route.profitToken || route.swaps[0]?.tokenIn;
+        const amountIn = route.swaps[0]?.amountIn;
+        if (!tokenIn || amountIn === undefined) throw new Error("Missing route input for gas estimation");
+        if (route.swaps.length < 2 ||
+            route.swaps[0].tokenIn.toLowerCase() !== tokenIn.toLowerCase() ||
+            route.swaps[route.swaps.length - 1].tokenOut.toLowerCase() !== tokenIn.toLowerCase() ||
+            route.profitToken.toLowerCase() !== tokenIn.toLowerCase()) {
+            throw new Error("Route is not a closed cycle");
+        }
+        return this.engine.executeArbitrage.estimateGas(tokenIn, amountIn, route);
+    }
 
     private async getDynamicGasPrice(provider: any): Promise<GasConfig> {
         if (!provider?.getFeeData) {
@@ -177,11 +212,37 @@ export class FlashLoanExecutor {
             const amountIn = route.swaps[0].amountIn;
 
             const receipt = await this.execute(tokenIn, amountIn, resolved);
+            let actualProfitRaw: bigint | undefined;
+            for (const log of receipt.logs ?? []) {
+                try {
+                    if (String(log.address).toLowerCase() !== String(this.engine.target).toLowerCase()) {
+                        continue;
+                    }
+                    const parsed = ENGINE_EVENTS.parseLog({ topics: log.topics as string[], data: log.data });
+                    if (parsed?.name === "ArbitrageFinished") {
+                        actualProfitRaw = BigInt(parsed.args.profit);
+                        break;
+                    }
+                } catch {
+                    // Ignore logs emitted by adapters/tokens.
+                }
+            }
+            const gasUsed = receipt.gasUsed;
+            const gasCostWei = gasUsed * (receipt.gasPrice ?? 0n);
+            if (actualProfitRaw === undefined) {
+                console.warn("ArbitrageFinished event not found; actual profit could not be verified");
+            }
             return {
                 success: true,
                 txHash: receipt.hash,
                 // Net profit is token-amount based; caller may refine USD value.
-                netProfitUSD: Number(route.minProfit || 0n) / 1e6
+                netProfitUSD: typeof opp?.netProfitUSD === "number"
+                    ? opp.netProfitUSD
+                    : Number(route.minProfit || 0n) / 1e6,
+                actualProfitRaw,
+                gasUsed,
+                gasCostWei,
+                profitVerified: actualProfitRaw !== undefined
             };
         } catch (e: any) {
             return { success: false, error: e?.message || String(e) };
@@ -226,8 +287,12 @@ export class FlashLoanExecutor {
                 gasLimit = (gasLimit * 120n) / 100n;
                 console.log("Estimated Gas Limit:", gasLimit.toString());
             } catch (estimateError) {
-                console.warn("Gas estimation failed, using default limit:", estimateError);
-                gasLimit = 650000n; // Fallback to default
+                if (process.env.ALLOW_GAS_ESTIMATE_FALLBACK === "true") {
+                    console.warn("Gas estimation failed, using configured fallback limit:", estimateError);
+                    gasLimit = 650000n;
+                } else {
+                    throw new Error(`Gas estimation failed; refusing execution: ${estimateError instanceof Error ? estimateError.message : String(estimateError)}`);
+                }
             }
 
             // Execute transaction with dynamic gas settings

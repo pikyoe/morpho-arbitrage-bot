@@ -13,9 +13,11 @@ export interface PairCandidate {
     tokenB: string;
 }
 
-/** Estimate liquidity (USD) for a pool from available fields; returns 0 when unknown. */
-function poolLiquidityUSD(pool: PoolInfo): number {
-    return pool.reserveUSD ?? pool.totalValueLockedUSD ?? 0;
+/** Estimate liquidity (USD); undefined means metadata is unavailable. */
+function poolLiquidityUSD(pool: PoolInfo): number | undefined {
+    const values = [pool.reserveUSD, pool.totalValueLockedUSD]
+        .filter((value): value is number => Number.isFinite(value) && value > 0);
+    return values.length > 0 ? Math.max(...values) : undefined;
 }
 
 export function toUniquePairs(tokens: string[]): PairCandidate[] {
@@ -76,9 +78,12 @@ export function filterPairs(
             // Still record for potential liquidity filtering below.
         }
 
-        // Liquidity filter: only reject pairs where EVERY matching pool is known below the threshold.
-        // Pools without reserveUSD are treated as unknown (allowed) since the RPC loader does not populate it.
-        const knownUnderMinimum = matches.every(p => poolLiquidityUSD(p) < minLiquidityUSD);
+        // Liquidity filter: reject only when every matching pool has a known
+        // value below the threshold. Unknown RPC liquidity is not the same as
+        // zero liquidity; the quote call remains the final liveness check.
+        const liquidityValues = matches.map(poolLiquidityUSD);
+        const allKnown = liquidityValues.length > 0 && liquidityValues.every(value => value !== undefined);
+        const knownUnderMinimum = allKnown && liquidityValues.every(value => (value as number) < minLiquidityUSD);
         if (knownUnderMinimum) continue;
 
         result.push(pair);

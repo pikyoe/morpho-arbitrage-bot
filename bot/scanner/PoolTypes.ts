@@ -34,4 +34,11 @@ export interface PoolInfo {
     sqrtPriceX96?: string; // Current price state
 
     tick?: number; // Current tick
+
+    /** Raw token reserves for V2-style pools (never interpreted as USD). */
+    reserve0Raw?: string;
+    reserve1Raw?: string;
+    /** How/when liquidity metadata was obtained. */
+    liquiditySource?: "subgraph" | "rpc" | "unknown";
+    liquidityUpdatedBlock?: number;
 }
