@@ -760,7 +760,11 @@ async function main() {
                     else if (name === "PancakeSwap") await rpcLoader.loadPancakeSwap(factoryAddr);
                     else await rpcLoader.loadUniswap(factoryAddr);
                 } catch (e: any) {
-                    console.log(`  ⚠️ RPC fallback ${name} failed (${e?.message || String(e)})`);
+                    const partial = poolCache.size() - before;
+                    const detail = partial > 0
+                        ? `partially failed after adding ${partial} pools`
+                        : "failed";
+                    console.log(`  ⚠️ RPC fallback ${name} ${detail} (${e?.message || String(e)})`);
                 }
                 const added = poolCache.size() - before;
                 if (added > 0) console.log(`  📦 RPC fallback +${name}: ${added} pools`);
