@@ -77,12 +77,6 @@ const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.1), 
 // price move between quote and execution; a fractional floor tolerates drift
 // while still guaranteeing the trade clears a share of its quoted edge.
 const MIN_PROFIT_BUFFER_PCT = Math.min(Math.max(Number(process.env.MIN_PROFIT_BUFFER_PCT || 50), 10), 90);
-// Optional flash-token allowlist (comma-separated addresses, case-insensitive).
-// The Morpho flash-loan path repays exactly the borrowed amount; flashed tokens
-// must have a 0 borrow fee on Morpho or repayment reverts. When set, execution
-// is restricted to these tokens (empty = no restriction, warned at startup).
-const FLASH_TOKEN_ALLOWLIST = (process.env.FLASH_TOKEN_ALLOWLIST || "")
-    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 const VERBOSE = process.env.WATCH_VERBOSE === "true";
 const GENERAL_DEX_NAMES = ["UniswapV3", "SushiSwap", "PancakeSwap"];
 const EFFECTIVE_TEST_AMOUNT_USD = Math.min(TEST_AMOUNT_USD, MAX_LOAN_USD);
@@ -621,15 +615,6 @@ async function main() {
             if (dexProviders.length < 2) {
                 console.log("  ⚠️ Fewer than 2 executable DEXes — no cross-DEX arbitrage possible in execution mode");
             }
-
-            // The Morpho flash-loan path repays exactly the borrowed amount; if
-            // the flashed token has a nonzero borrow fee on Morpho, repayment
-            // reverts. FLASH_TOKEN_ALLOWLIST restricts execution to safe tokens.
-            if (FLASH_TOKEN_ALLOWLIST.length === 0) {
-                console.log("  ⚠️ FLASH_TOKEN_ALLOWLIST empty — flashed tokens must have a 0 borrow fee on Morpho, otherwise repayment reverts");
-            } else {
-                console.log(`  🔒 Execution restricted to flash tokens: ${FLASH_TOKEN_ALLOWLIST.join(", ")}`);
-            }
             console.log(`✅ Execution ready (engine ${engineAddress.slice(0,8)}…)\n`);
         }
     }
@@ -818,13 +803,6 @@ async function main() {
                 continue;
             }
 
-            // Flash-token allowlist guard (see FLASH_TOKEN_ALLOWLIST).
-            if (FLASH_TOKEN_ALLOWLIST.length > 0 && !FLASH_TOKEN_ALLOWLIST.includes(tokenA.toLowerCase())) {
-                if (VERBOSE) console.log(`  ⏭️ ${tokenA.slice(0,6)} not in FLASH_TOKEN_ALLOWLIST — skipping execution`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-                continue;
-            }
-
             const opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
             try {
                 const ok = await engineContract!.validateRoute(opp.route, tokenA);
@@ -966,13 +944,6 @@ async function main() {
 
         if (!executor) {
             console.log("  ⚠️ Execution not configured — would execute but watch-only mode.");
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-            continue;
-        }
-
-        // Flash-token allowlist guard (see FLASH_TOKEN_ALLOWLIST).
-        if (FLASH_TOKEN_ALLOWLIST.length > 0 && !FLASH_TOKEN_ALLOWLIST.includes(WATCH_PAIR_A.toLowerCase())) {
-            if (VERBOSE) console.log(`  ⏭️ ${WATCH_PAIR_A.slice(0,6)} not in FLASH_TOKEN_ALLOWLIST — skipping execution`);
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
             continue;
         }
