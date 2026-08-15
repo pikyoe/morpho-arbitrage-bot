@@ -5,7 +5,7 @@ export function loadEnvForNetwork(hre: any) {
   const name = (hre as any).network?.name ?? "";
   const root = process.cwd();
 
-  let envFile = ".env";
+  let envFile = ".env.mainnet";
 
   if (/sepolia/i.test(name)) {
     envFile = ".env.sepolia";
