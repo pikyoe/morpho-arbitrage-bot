@@ -163,16 +163,44 @@ function buildDexProviders(): DexQuoteProvider[] {
     return providers;
 }
 
-function getDecimals(addr: string): number {
-    return TOKEN_DECIMALS[addr.toLowerCase()] || 18;
+const ERC20_DECIMALS_ABI = ["function decimals() view returns (uint8)"];
+const _decimalsCache = new Map<string, number>();
+const _decimalsInFlight = new Map<string, Promise<number>>();
+
+/** Token decimals: static table first, then one on-chain decimals() call (cached). */
+async function getDecimals(addr: string): Promise<number> {
+    const lower = addr.toLowerCase();
+    const table = TOKEN_DECIMALS[lower];
+    if (table !== undefined) return table;
+    const cached = _decimalsCache.get(lower);
+    if (cached !== undefined) return cached;
+    const inFlight = _decimalsInFlight.get(lower);
+    if (inFlight) return inFlight;
+    const lookup = (async (): Promise<number> => {
+        try {
+            const tokenContract = new Contract(lower, ERC20_DECIMALS_ABI, provider);
+            const dec = Number(await tokenContract.decimals());
+            return Number.isFinite(dec) && dec > 0 ? dec : 18;
+        } catch {
+            return 18; // unresolvable — last resort
+        }
+    })();
+    _decimalsInFlight.set(lower, lookup);
+    try {
+        const decimals = await lookup;
+        _decimalsCache.set(lower, decimals);
+        return decimals;
+    } finally {
+        _decimalsInFlight.delete(lower);
+    }
 }
 
-function formatAmount(amount: bigint, addr: string): string {
-    return Number(formatUnits(amount, getDecimals(addr))).toFixed(6);
+async function formatAmount(amount: bigint, addr: string): Promise<string> {
+    return Number(formatUnits(amount, await getDecimals(addr))).toFixed(6);
 }
 
-function tokenAmountToNumber(amount: bigint, token: string): number {
-    return Number(formatUnits(amount, getDecimals(token)));
+async function tokenAmountToNumber(amount: bigint, token: string): Promise<number> {
+    return Number(formatUnits(amount, await getDecimals(token)));
 }
 
 function percentageOf(numerator: bigint, denominator: bigint): number {
@@ -184,7 +212,7 @@ function percentageOf(numerator: bigint, denominator: bigint): number {
  *  Uses a token→USDC quote as the USD price reference for non-stable tokens.
  */
 async function usdToTokenAmount(usd: number, token: string): Promise<bigint> {
-    const decimals = getDecimals(token);
+    const decimals = await getDecimals(token);
     const lower = token.toLowerCase();
 
     // Stablecoins / near-$1 tokens
@@ -232,9 +260,9 @@ async function tokenUsdPrice(token: string): Promise<number> {
     if (stable.has(lower)) return 1;
     const cached = _usdPriceCache.get(lower);
     if (cached && cached.expiresAt > Date.now()) return cached.price;
-    const quote = await quoteOnRaw(token, TOKENS.USDC, parseUnits("1", getDecimals(token)));
+    const quote = await quoteOnRaw(token, TOKENS.USDC, parseUnits("1", await getDecimals(token)));
     if (quote && quote.amountOut > 0n) {
-        const price = Number(formatUnits(quote.amountOut, getDecimals(TOKENS.USDC)));
+        const price = Number(formatUnits(quote.amountOut, await getDecimals(TOKENS.USDC)));
         if (Number.isFinite(price) && price > 0) {
             _usdPriceCache.set(lower, { price, expiresAt: Date.now() + 30_000 });
             return price;
@@ -251,7 +279,7 @@ async function tokenUsdPrice(token: string): Promise<number> {
 }
 
 async function tokenAmountToUsd(amount: bigint, token: string): Promise<number> {
-    return Number(formatUnits(amount, getDecimals(token))) * await tokenUsdPrice(token);
+    return Number(formatUnits(amount, await getDecimals(token))) * await tokenUsdPrice(token);
 }
 
 /** Quote a single direction on one provider, returning amountOut (0 if unavailable). */
@@ -360,7 +388,7 @@ async function scanAllPairs(
     pairs: { tokenA: string; tokenB: string }[],
     dexProviders: DexQuoteProvider[],
     amountInForToken: (token: string) => Promise<bigint>,
-    formatAmount: (amount: bigint, addr: string) => string
+    formatAmount: (amount: bigint, addr: string) => Promise<string>
 ): Promise<any[]> {
     const filtered = filterPairs(pairs as any, {
         minLiquidityUSD: MIN_LIQUIDITY_USD,
@@ -519,7 +547,7 @@ async function buildOpportunity(
     if (!Number.isFinite(tokenPriceUSD) || tokenPriceUSD <= 0) {
         tokenPriceUSD = await tokenUsdPrice(tokenIn);
     }
-    const netProfitUSD = Number(formatUnits(profit, getDecimals(tokenIn))) * tokenPriceUSD;
+    const netProfitUSD = Number(formatUnits(profit, await getDecimals(tokenIn))) * tokenPriceUSD;
 
     return {
         route: {
@@ -752,7 +780,7 @@ async function main() {
     if (WATCH_MODE === "single") {
         try {
             amountInSingle = await usdToTokenAmount(EFFECTIVE_TEST_AMOUNT_USD, WATCH_PAIR_A);
-            console.log(`Single-pair monitoring amount: ${formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${EFFECTIVE_TEST_AMOUNT_USD})\n`);
+            console.log(`Single-pair monitoring amount: ${await formatAmount(amountInSingle, WATCH_PAIR_A)} ${WATCH_PAIR_A.slice(0,6)} (~$${EFFECTIVE_TEST_AMOUNT_USD})\n`);
         } catch (e: any) {
             console.error(`❌ Cannot size the monitoring amount for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}).`);
             console.error("   USD pricing needs UNISWAP_QUOTER_ADDRESS/UNISWAP_FACTORY_ADDRESS (or use WATCH_MODE=list). Exiting.");
@@ -895,7 +923,7 @@ async function main() {
         if (VERBOSE) {
             console.log(`\n[loop ${loop}] Quotes (${WATCH_PAIR_A.slice(0,6)}→${WATCH_PAIR_B.slice(0,6)}):`);
             for (const { dex, q } of saneBuyQuotes) {
-                console.log(`  ${dex}: ${formatAmount(q.amountOut, WATCH_PAIR_B)} ${WATCH_PAIR_B.slice(0,6)} (fee ${q.fee ?? "?"})`);
+                console.log(`  ${dex}: ${await formatAmount(q.amountOut, WATCH_PAIR_B)} ${WATCH_PAIR_B.slice(0,6)} (fee ${q.fee ?? "?"})`);
             }
         }
 
@@ -926,7 +954,7 @@ async function main() {
                 const spreadPct = Number((profit * 1000000n) / amountIn) / 10000;
 
                 if (VERBOSE) {
-                    console.log(`  ${buy.dex}→${sell.dex}: ${formatAmount(amountBack, WATCH_PAIR_A)} back (${spreadPct.toFixed(3)}%)`);
+                    console.log(`  ${buy.dex}→${sell.dex}: ${await formatAmount(amountBack, WATCH_PAIR_A)} back (${spreadPct.toFixed(3)}%)`);
                 }
 
                 if (!best || profitUSD > best.netProfitUSD) {
