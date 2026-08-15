@@ -739,8 +739,12 @@ async function main() {
             }
         }
 
-        // 2) Factory RPC fallback for DEXes with no subgraph pools (uses WS/RPC rate limiter)
-        if (POOL_RPC_FALLBACK) {
+        // 2) Factory RPC fallback for DEXes with no subgraph pools (uses WS/RPC rate limiter).
+        // In targeted list mode with factory discovery enabled, the configured pairs are already
+        // loaded precisely by loadPair above — a whole-universe sweep (the Aerodrome loader
+        // iterates every token pair, ~420+ calls) would only burn RPC budget and rate-limit boot.
+        const targetedPairsCovered = WATCH_MODE === "list" && process.env.TARGETED_ALLOW_RPC_POOL_DISCOVERY === "true";
+        if (POOL_RPC_FALLBACK && !targetedPairsCovered) {
             const rpcLoader = new PoolLoader(provider, poolCache);
             for (const [name, factoryAddr] of [
                 ["UniswapV3", process.env.UNISWAP_FACTORY_ADDRESS],
