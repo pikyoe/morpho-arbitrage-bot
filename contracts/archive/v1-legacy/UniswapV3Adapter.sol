@@ -167,7 +167,6 @@ contract UniswapV3Adapter is Ownable, IAdapter {
                 tokenOut: tokenOut,
                 fee: fee,
                 recipient: recipient,
-                deadline: deadline,
                 amountIn: amountIn,
                 amountOutMinimum: amountOutMinimum,
                 sqrtPriceLimitX96: 0
