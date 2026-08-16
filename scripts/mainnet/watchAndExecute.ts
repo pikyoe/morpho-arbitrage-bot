@@ -17,7 +17,8 @@ import { SushiSwapDexProvider } from "../../bot/scanner/quote/SushiSwapDexProvid
 import { PancakeSwapDexProvider } from "../../bot/scanner/quote/PancakeSwapDexProvider.js";
 import { AerodromeDexProvider } from "../../bot/scanner/quote/AerodromeDexProvider.js";
 import { DexQuoteProvider } from "../../bot/scanner/quote/DexQuoteProvider.js";
-import { QuoteResult } from "../../bot/scanner/quote/index.js";
+import { QuoteRequest, QuoteResult } from "../../bot/scanner/quote/index.js";
+import { OneInchAggregator } from "../../bot/scanner/aggregator/OneInchAggregator.js";
 import { AdapterRegistry } from "../../bot/registry/AdapterRegistry.js";
 import { FlashLoanExecutor } from "../../bot/executor/FlashLoanExecutor.js";
 import { TOKEN_DECIMALS, TOKENS } from "../../bot/scanner/TokenList.js";
@@ -78,6 +79,12 @@ const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.1), 
 // while still guaranteeing the trade clears a share of its quoted edge.
 const MIN_PROFIT_BUFFER_PCT = Math.min(Math.max(Number(process.env.MIN_PROFIT_BUFFER_PCT || 50), 10), 90);
 const VERBOSE = process.env.WATCH_VERBOSE === "true";
+// 1inch API quotes (INCH_API_KEY/INCH_API_BASE_URL) act as an additional
+// aggregated price source for spread detection. WATCH_USE_1INCH=false disables
+// it even when credentials are present. Execution through 1inch requires the
+// deployed OneInchAdapterV2 address in INCH_ADAPTER_V2_ADDRESS; without it the
+// 1inch legs are detection-only.
+const USE_1INCH = process.env.WATCH_USE_1INCH !== "false";
 const GENERAL_DEX_NAMES = ["UniswapV3", "SushiSwap", "PancakeSwap"];
 // Test-size ladder: start at WATCH_TEST_USD_START, ramp by WATCH_TEST_USD_STEP
 // every WATCH_TEST_USD_RAMP_LOOPS scan loops up to WATCH_TEST_USD (the max),
@@ -137,6 +144,36 @@ const provider = rpcProviders.length > 1
     : rpcProviders[0];
 const wallet = PRIVATE_KEY ? new Wallet(PRIVATE_KEY, provider) : null;
 const poolCache = new PoolCache();
+
+// ------------------------------------------------------------------
+// 1inch aggregator (optional aggregated quote source)
+// ------------------------------------------------------------------
+const oneInchAggregator: OneInchAggregator | null =
+    USE_1INCH && process.env.INCH_API_KEY && process.env.INCH_API_BASE_URL
+        ? new OneInchAggregator(process.env.INCH_API_KEY, process.env.INCH_API_BASE_URL)
+        : null;
+
+/** Quote the 1inch aggregated price for a request; null when disabled/unavailable. */
+async function quoteOneInch(request: QuoteRequest): Promise<QuoteResult | null> {
+    if (!oneInchAggregator || !oneInchAggregator.isEnabled()) {
+        return null;
+    }
+    try {
+        const q = await oneInchAggregator.getQuote(request);
+        return q && q.amountOut > 0n ? q : null;
+    } catch {
+        return null;
+    }
+}
+
+/** True when the DEX/aggregator name maps to a deployed engine adapter. */
+function hasEngineAdapter(dex: string, registry: AdapterRegistry): boolean {
+    try {
+        return /^0x[a-fA-F0-9]{40}$/.test(registry.get(dex));
+    } catch {
+        return false;
+    }
+}
 
 function buildDexProviders(): DexQuoteProvider[] {
     const providers: DexQuoteProvider[] = [];
@@ -446,12 +483,14 @@ async function scanAllPairs(
                     const amountIn = await amountInForToken(pair.tokenA);
                     if (amountIn <= 0n) return null;
 
-                    // Phase 1: quote A→B on every DEX.
+                    // Phase 1: quote A→B on every DEX (plus the 1inch aggregate).
                     const buyQuotes: { dex: string; q: QuoteResult }[] = [];
                     for (const dex of dexProviders) {
                         const qBuy = await quoteOn(dex, pair.tokenA, pair.tokenB, amountIn);
                         if (qBuy) buyQuotes.push({ dex: dex.getDexName(), q: qBuy });
                     }
+                    const qInchBuy = await quoteOneInch({ tokenIn: pair.tokenA, tokenOut: pair.tokenB, amountIn });
+                    if (qInchBuy) buyQuotes.push({ dex: "1INCH", q: qInchBuy });
                     const saneBuyQuotes = filterQuoteOutliers(buyQuotes, "buy");
                     if (saneBuyQuotes.length < 2) {
                         return null;
@@ -462,12 +501,15 @@ async function scanAllPairs(
                     const bestBuy = saneBuyQuotes[0];
                     const buyAmountOut = bestBuy.q.amountOut;
 
-                    // Phase 2: quote B→A on every DEX using the SAME buyAmountOut.
+                    // Phase 2: quote B→A on every DEX (plus the 1inch aggregate)
+                    // using the SAME buyAmountOut.
                     const sellQuotes: { dex: string; q: QuoteResult }[] = [];
                     for (const dex of dexProviders) {
                         const qSell = await quoteOn(dex, pair.tokenB, pair.tokenA, buyAmountOut);
                         if (qSell) sellQuotes.push({ dex: dex.getDexName(), q: qSell });
                     }
+                    const qInchSell = await quoteOneInch({ tokenIn: pair.tokenB, tokenOut: pair.tokenA, amountIn: buyAmountOut });
+                    if (qInchSell) sellQuotes.push({ dex: "1INCH", q: qInchSell });
                     const saneSellQuotes = filterQuoteOutliers(sellQuotes, "sell");
 
                     // Best round-trip: buy at bestBuy.dex, sell at the best cross-DEX.
@@ -530,28 +572,57 @@ async function buildOpportunity(
     profit: bigint,
     adapterRegistry: AdapterRegistry
 ): Promise<any> {
-    const step = (q: QuoteResult, amountInRaw: bigint, minOut: bigint) => ({
-        adapter: adapterRegistry.get(q.dex),
-        tokenIn: q.tokenIn,
-        tokenOut: q.tokenOut,
-        fee: q.fee ?? 0,
-        amountIn: amountInRaw,
-        minAmountOut: minOut,
-        data: q.dex === "AERODROME"
-            ? AbiCoder.defaultAbiCoder().encode(
-                ["bool", "address"],
-                [q.stable ?? false, q.factory ?? "0x0000000000000000000000000000000000000000"]
-            )
-            : "0x",
-        deadline: Math.floor(Date.now() / 1000) + 60
-    });
-
     // Apply slippage tolerance to each leg's minimum output (capped at 1.5%).
     const slip = (out: bigint) => (out * (1000n - BigInt(Math.round(SLIPPAGE_PCT * 10)))) / 1000n;
+    const deadline = Math.floor(Date.now() / 1000) + 60;
+
+    const buildStep = async (q: QuoteResult, amountInRaw: bigint, minOut: bigint) => {
+        let data: string;
+        if (q.dex === "1INCH") {
+            // 1inch calldata is amount-specific: fetch it fresh for the exact
+            // amount this step will swap, executed by the deployed 1inch adapter.
+            const oneInchAdapter = adapterRegistry.get("1INCH");
+            if (!oneInchAggregator) {
+                throw new Error("1inch aggregator not configured (INCH_API_KEY/INCH_API_BASE_URL)");
+            }
+            const swapData = await oneInchAggregator.getSwapData(
+                { tokenIn: q.tokenIn, tokenOut: q.tokenOut, amountIn: amountInRaw },
+                oneInchAdapter,
+                Math.round(SLIPPAGE_PCT * 100), // 1inch slippage in basis points
+                { receiver: oneInchAdapter, deadline }
+            );
+            if (!swapData?.tx?.data) {
+                throw new Error(`1inch swap data unavailable for ${q.tokenIn.slice(0, 6)}→${q.tokenOut.slice(0, 6)}`);
+            }
+            data = swapData.tx.data;
+        } else if (q.dex === "AERODROME") {
+            data = AbiCoder.defaultAbiCoder().encode(
+                ["bool", "address"],
+                [q.stable ?? false, q.factory ?? "0x0000000000000000000000000000000000000000"]
+            );
+        } else {
+            data = "0x";
+        }
+
+        return {
+            adapter: adapterRegistry.get(q.dex),
+            tokenIn: q.tokenIn,
+            tokenOut: q.tokenOut,
+            fee: q.fee ?? 0,
+            amountIn: amountInRaw,
+            minAmountOut: minOut,
+            data,
+            deadline
+        };
+    };
+
+    // 1inch legs need an exact input amount (their calldata is amount-specific),
+    // so the reverse 1inch leg uses the amount its quote was built for instead of
+    // 0. DEX legs keep 0 so ArbitrageEngineV2 fills in the actual first-leg output.
+    const reverseAmountIn = reverse.dex === "1INCH" ? reverse.amountIn : 0n;
     const steps = [
-        step(forward, amountIn, slip(forward.amountOut)),
-        // Let ArbitrageEngineV2 use the actual output of the first leg.
-        step(reverse, 0n, slip(reverse.amountOut))
+        await buildStep(forward, amountIn, slip(forward.amountOut)),
+        await buildStep(reverse, reverseAmountIn, slip(reverse.amountOut))
     ];
 
     // Net profit in USD: raw profit → token units → USD. Use the
@@ -648,7 +719,19 @@ async function main() {
         console.log("⚠️ Need at least 2 DEX providers configured. Check env (UNISWAP/SUSHISWAP/PANCAKESWAP/AERODROME *_QUOTER/_FACTORY).");
         return;
     }
-    console.log(`✅ ${dexProviders.length} DEX providers ready: ${dexProviders.map(d => d.getDexName()).join(", ")}\n`);
+    console.log(`✅ ${dexProviders.length} DEX providers ready: ${dexProviders.map(d => d.getDexName()).join(", ")}`);
+    if (oneInchAggregator) {
+        const inchExec = process.env.INCH_ADAPTER_V2_ADDRESS ? "execution + " : "";
+        console.log(`✅ 1inch aggregator enabled (${inchExec}spread detection) @ ${process.env.INCH_API_BASE_URL}`);
+        if (!process.env.INCH_ADAPTER_V2_ADDRESS) {
+            console.log("   ℹ️ INCH_ADAPTER_V2_ADDRESS not set — 1inch legs are detection-only until the adapter is deployed and approved");
+        }
+    } else if (USE_1INCH) {
+        console.log("ℹ️ 1inch aggregator disabled (set INCH_API_KEY + INCH_API_BASE_URL in the env file)");
+    } else {
+        console.log("ℹ️ 1inch aggregator disabled (WATCH_USE_1INCH=false)");
+    }
+    console.log();
 
     // Set up executor if execution enabled
     let executor: FlashLoanExecutor | null = null;
@@ -663,7 +746,8 @@ async function main() {
                 process.env.UNISWAP_ADAPTER_V2_ADDRESS || "",
                 process.env.SUSHISWAP_ADAPTER_V2_ADDRESS || "",
                 process.env.PANCAKESWAP_ADAPTER_V2_ADDRESS || "",
-                process.env.AERODROME_ADAPTER_V2_ADDRESS || ""
+                process.env.AERODROME_ADAPTER_V2_ADDRESS || "",
+                process.env.INCH_ADAPTER_V2_ADDRESS || ""
             );
             engineContract = new Contract(
                 engineAddress,
@@ -902,7 +986,22 @@ async function main() {
                 continue;
             }
 
-            const opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
+            // A 1inch leg can only execute once INCH_ADAPTER_V2_ADDRESS is set and
+            // approved on the engine; otherwise it stays detection-only.
+            if (!hasEngineAdapter(forward.dex, adapterRegistry!) || !hasEngineAdapter(reverse.dex, adapterRegistry!)) {
+                console.log(`  ⚠️ Best spread ${forward.dex}→${reverse.dex} needs an unconfigured adapter (set INCH_ADAPTER_V2_ADDRESS and approve it on the engine) — detection only, skipping execution.`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
+            }
+
+            let opp: any;
+            try {
+                opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
+            } catch (e: any) {
+                console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
+            }
             try {
                 const ok = await engineContract!.validateRoute(opp.route, tokenA);
                 if (!ok) {
@@ -965,6 +1064,8 @@ async function main() {
             if (qBuy) buyQuotes.push({ dex: dex.getDexName(), q: qBuy });
 
         }
+        const qInchBuy = await quoteOneInch({ tokenIn: WATCH_PAIR_A, tokenOut: WATCH_PAIR_B, amountIn });
+        if (qInchBuy) buyQuotes.push({ dex: "1INCH", q: qInchBuy });
         // Same outlier guard as multi-pair mode: drop stale/dust quotes so a
         // phantom spread cannot trigger a gas-burning execution attempt.
         const saneBuyQuotes = filterQuoteOutliers(buyQuotes, "buy");
@@ -999,6 +1100,9 @@ async function main() {
                 const sellQuote = await quoteOn(sellDex, WATCH_PAIR_B, WATCH_PAIR_A, buy.q.amountOut);
                 if (sellQuote) sellQuotes.push({ dex: sellDex.getDexName(), q: sellQuote });
             }
+            // 1inch as the reverse leg (skipped when 1inch was already the buy leg).
+            const qInchSell = await quoteOneInch({ tokenIn: WATCH_PAIR_B, tokenOut: WATCH_PAIR_A, amountIn: buy.q.amountOut });
+            if (qInchSell && buy.dex !== "1INCH") sellQuotes.push({ dex: "1INCH", q: qInchSell });
             for (const sell of filterQuoteOutliers(sellQuotes, "sell")) {
                 const amountBack = sell.q.amountOut; // in token A
                 if (amountBack <= amountIn) continue;
@@ -1051,9 +1155,24 @@ async function main() {
             continue;
         }
 
+        // A 1inch leg can only execute once INCH_ADAPTER_V2_ADDRESS is set and
+        // approved on the engine; otherwise it stays detection-only.
+        if (!hasEngineAdapter(forward.dex, adapterRegistry!) || !hasEngineAdapter(reverse.dex, adapterRegistry!)) {
+            console.log(`  ⚠️ Best spread ${forward.dex}→${reverse.dex} needs an unconfigured adapter (set INCH_ADAPTER_V2_ADDRESS and approve it on the engine) — detection only, skipping execution.`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
+        }
+
         // Build opportunity & execute
         const profit = reverse.amountOut - amountIn;
-        const opp = await buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
+        let opp: any;
+        try {
+            opp = await buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
+        } catch (e: any) {
+            console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
+        }
 
         // Validate route on-chain before spending gas (non-fatal if it fails)
         try {
