@@ -33,6 +33,9 @@ process.env.WATCH_POOL_REFRESH_LOOPS ||= "12";
 process.env.WATCH_TEST_USD ||= "500";
 process.env.WATCH_POLL_MS ||= "5000";
 process.env.MIN_DEX_VARIETY ||= "2";
+// Low-RPC watcher: use the 1inch API (INCH_API_KEY/INCH_API_BASE_URL) as an
+// additional aggregated quote source for spread detection.
+process.env.WATCH_USE_1INCH ||= "true";
 
 // Keep startup RPC usage low unless the user explicitly opts in.
 // TARGETED_ALLOW_RPC_POOL_DISCOVERY=true enables factory RPC discovery for the
@@ -52,5 +55,10 @@ process.env.WATCH_ENABLE_EXECUTION ||= "false";
 console.log("🎯 Targeted watcher configuration");
 console.log(`Pairs: ${process.env.WATCH_PAIRS}`);
 console.log(`Execution: ${process.env.WATCH_ENABLE_EXECUTION}`);
+if (process.env.INCH_API_KEY && process.env.INCH_API_BASE_URL) {
+    console.log(`1inch API: enabled (${process.env.INCH_API_BASE_URL})`);
+} else {
+    console.log("1inch API: disabled (INCH_API_KEY / INCH_API_BASE_URL not set in env file)");
+}
 
 await import("./watchAndExecute.js");

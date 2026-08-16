@@ -8,12 +8,13 @@ export class AdapterRegistry {
         public readonly sushiSwap: string,
         public readonly pancakeSwap: string,
         public readonly aerodrome: string,
+        public readonly oneInch: string = "",
     ) {}
 
     /**
      * Resolve a DEX name (as reported by the provider) to the adapter address.
-     * Accepts both the provider names ("UniswapV3", "SushiSwap", "PancakeSwap", "Aerodrome")
-     * and the legacy uppercase forms ("UNISWAP", "AERODROME").
+     * Accepts both the provider names ("UniswapV3", "SushiSwap", "PancakeSwap",
+     * "Aerodrome", "1INCH") and the legacy uppercase forms ("UNISWAP", "AERODROME").
      */
     get(dex: string): string {
         switch (dex) {
@@ -32,6 +33,11 @@ export class AdapterRegistry {
             case "Aerodrome":
             case "AERODROME":
                 return this.aerodrome;
+
+            case "1INCH":
+            case "OneInch":
+            case "ONEINCH":
+                return this.oneInch;
 
             default:
                 throw new Error(`Unknown DEX: ${dex}`);

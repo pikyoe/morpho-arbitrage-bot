@@ -1,4 +1,5 @@
 import { QuoteRequest, QuoteResult } from "../quote/index.js";
+import { oneInchRateLimiter } from "../../utils/RateLimiter.js";
 
 interface OneInchQuoteResponse {
     fromToken: {
@@ -92,16 +93,34 @@ export class OneInchAggregator {
         return `${baseUrl}/quote?${params.toString()}`;
     }
 
-    private buildSwapUrl(request: QuoteRequest, fromAddress: string, slippage: number): string {
+    private buildSwapUrl(
+        request: QuoteRequest,
+        fromAddress: string,
+        slippage: number,
+        options: { receiver?: string; deadline?: number } = {}
+    ): string {
         const baseUrl = this.baseUrl.replace(/\/$/, '');
         const params = new URLSearchParams({
             fromTokenAddress: request.tokenIn.toLowerCase(),
             toTokenAddress: request.tokenOut.toLowerCase(),
             amount: request.amountIn.toString(),
             fromAddress,
+            // 1inch slippage is expressed in basis points (100 = 1%).
             slippage: slippage.toString(),
-            chainId: '8453'
+            chainId: '8453',
+            // Skip the on-chain estimation: the executor (adapter) holds no
+            // balance at quote time, so a simulation would fail. Slippage is
+            // enforced on-chain via the encoded minReturn + the engine's own
+            // step.minAmountOut check.
+            disableEstimate: 'true'
         });
+
+        if (options.receiver) {
+            params.set('receiver', options.receiver);
+        }
+        if (options.deadline) {
+            params.set('deadline', options.deadline.toString());
+        }
 
         return `${baseUrl}/swap?${params.toString()}`;
     }
@@ -116,6 +135,9 @@ export class OneInchAggregator {
         }
 
         try {
+            // Rate limit 1inch API calls to stay within the free-tier quota.
+            await oneInchRateLimiter.wait();
+
             const url = this.buildQuoteUrl(request);
 
             const response = await fetch(url, {
@@ -155,15 +177,23 @@ export class OneInchAggregator {
     }
 
     /**
-     * Get swap data from 1inch API (for execution)
+     * Get swap data from 1inch API (for execution).
+     * `fromAddress` is the contract that will execute the swap (the 1inch
+     * adapter); pass `receiver` to route the output to a different address
+     * (defaults to `fromAddress`). The returned `tx.data` is executed against
+     * `tx.to` (AggregationRouterV6).
      */
     public async getSwapData(
         request: QuoteRequest,
         fromAddress: string,
-        slippage: number = 1
+        slippage: number = 100,
+        options: { receiver?: string; deadline?: number } = {}
     ): Promise<any | null> {
         try {
-            const url = this.buildSwapUrl(request, fromAddress, slippage);
+            // Rate limit 1inch API calls to stay within the free-tier quota.
+            await oneInchRateLimiter.wait();
+
+            const url = this.buildSwapUrl(request, fromAddress, slippage, options);
 
             const response = await fetch(url, {
                 method: 'GET',
