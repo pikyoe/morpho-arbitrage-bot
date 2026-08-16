@@ -115,6 +115,10 @@ contract UniswapV3AdapterV2 is
                     tokenOut: step.tokenOut,
                     fee: step.fee,
                     recipient: engine,
+<<<<<<< HEAD
+=======
+                    deadline: deadline,
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
                     amountIn: step.amountIn,
                     amountOutMinimum: step.minAmountOut,
                     sqrtPriceLimitX96: 0
@@ -122,7 +126,14 @@ contract UniswapV3AdapterV2 is
             );
 
         IERC20(step.tokenIn)
+<<<<<<< HEAD
             .forceApprove(router, 0);
+=======
+            .forceApprove(
+                router,
+                0
+            );
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
 
         emit Events.SwapExecuted(
             address(this),

@@ -6,7 +6,11 @@ async function main() {
     const { ethers } = connection;
 
     loadEnvForNetwork(hre);
+<<<<<<< HEAD
     ensureChain([8453n, 31337n, 84532n], connection);
+=======
+    ensureChain(84532n, connection);
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
 
     const signer = await ethers.provider.getSigner();
     const deployerAddress = await signer.getAddress();
