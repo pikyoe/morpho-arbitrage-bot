@@ -14,11 +14,7 @@ import "../libraries/Strategy.sol";
 import "../libraries/Errors.sol";
 import "../libraries/Events.sol";
 
-<<<<<<< HEAD
 contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, Pausable {
-=======
-contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
     using SafeERC20 for IERC20;
 
     ////////////////////////////////////////////////////////////
@@ -37,11 +33,7 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
 
     uint256 public flashLoanAmount;
 
-<<<<<<< HEAD
     address public flashLoanInitiator;
-=======
-    bool public paused;
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
 
     mapping(address => bool) public authorizedCaller;
 
@@ -65,13 +57,8 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
         _;
     }
 
-<<<<<<< HEAD
     modifier onlyWhenNotPaused() {
         if (paused()) {
-=======
-    modifier whenNotPaused() {
-        if (paused) {
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
             revert Errors.InvalidState();
         }
         _;
@@ -81,7 +68,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
     //                     CONSTRUCTOR
     ////////////////////////////////////////////////////////////
 
-<<<<<<< HEAD
     constructor(
         address initialOwner,
         address _morphoFlashLoan,
@@ -89,9 +75,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
         address uniswapAdapter,
         address aerodromeAdapter
     ) Ownable(initialOwner) {
-=======
-    constructor(address _morphoFlashLoan, address _profitReceiver) Ownable(msg.sender) {
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
         if (_morphoFlashLoan == address(0)) {
             revert Errors.InvalidAddress();
         }
@@ -100,7 +83,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
             revert Errors.InvalidAddress();
         }
 
-<<<<<<< HEAD
         if (uniswapAdapter == address(0)) {
             revert Errors.InvalidAddress();
         }
@@ -109,8 +91,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
             revert Errors.InvalidAddress();
         }
 
-=======
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
         morphoFlashLoan = _morphoFlashLoan;
         profitReceiver = _profitReceiver;
 
@@ -142,7 +122,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
     }
 
     function setPaused(bool status) external onlyOwner {
-<<<<<<< HEAD
         if (status) {
             if (!paused()) {
                 _pause();
@@ -153,9 +132,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
             }
         }
 
-=======
-        paused = status;
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
         emit Events.Paused(status);
     }
 
@@ -177,11 +153,7 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
         address token,
         uint256 amount,
         Strategy.Route calldata route
-<<<<<<< HEAD
     ) external onlyAuthorized onlyWhenNotPaused {
-=======
-    ) external onlyAuthorized whenNotPaused nonReentrant {
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
         if (token == address(0)) {
             revert Errors.InvalidToken();
         }
@@ -216,11 +188,7 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
         address token,
         uint256 amount,
         bytes calldata data
-<<<<<<< HEAD
     ) external onlyFlashLoan onlyWhenNotPaused {
-=======
-    ) external onlyFlashLoan whenNotPaused nonReentrant {
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
         if (amount == 0) {
             revert Errors.InvalidAmount();
         }
@@ -250,11 +218,8 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
 
         emit Events.FlashLoanReceived(flashLoanToken, amount);
 
-<<<<<<< HEAD
         uint256 profitTokenBalanceBefore = IERC20(route.profitToken).balanceOf(address(this));
 
-=======
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
         _executeRoute(route, amount);
 
         _approveRepayment();
@@ -302,13 +267,10 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
                 revert Errors.InvalidToken();
             }
 
-<<<<<<< HEAD
             if (step.minAmountOut == 0) {
                 revert Errors.InvalidSlippage();
             }
 
-=======
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
             if (i > 0 && step.tokenIn != previousTokenOut) {
                 revert Errors.InvalidRoute();
             }
@@ -385,7 +347,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
         emit Events.FlashLoanRepaid(flashLoanToken, flashLoanAmount);
     }
 
-<<<<<<< HEAD
     function _sendProfit(Strategy.Route memory route, uint256 profitTokenBalanceBefore)
         internal
         returns (uint256 profitAmount)
@@ -394,10 +355,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
         profitAmount = profitTokenBalanceAfter > profitTokenBalanceBefore
             ? profitTokenBalanceAfter - profitTokenBalanceBefore
             : 0;
-=======
-    function _sendProfit(Strategy.Route memory route) internal returns (uint256 profitAmount) {
-        profitAmount = IERC20(route.profitToken).balanceOf(address(this));
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
 
         if (profitAmount < route.minProfit) {
             revert Errors.InsufficientProfit();
@@ -411,7 +368,6 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
         flashLoanAmount = 0;
         flashLoanInitiator = address(0);
     }
-<<<<<<< HEAD
 
     function rescueToken(address token, uint256 amount) external onlyOwner {
         if (token == address(0)) {
@@ -445,6 +401,4 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, ReentrancyGuard {
             revert Errors.RescueFailed();
         }
     }
-=======
->>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
 }
