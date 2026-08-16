@@ -32,6 +32,7 @@ contract MorphoFlashLoanV2 is Ownable, Pausable {
 
     address public flashToken;
 
+    bool public paused;
 
     modifier onlyEngine()
     {
@@ -52,9 +53,15 @@ contract MorphoFlashLoanV2 is Ownable, Pausable {
         _;
     }
 
+<<<<<<< HEAD
     modifier onlyWhenNotPaused()
     {
         if(paused())
+=======
+    modifier whenNotPaused()
+    {
+        if(paused)
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
             revert Errors.InvalidState();
 
         _;
@@ -92,6 +99,7 @@ contract MorphoFlashLoanV2 is Ownable, Pausable {
         external
         onlyOwner
     {
+<<<<<<< HEAD
         if (status) {
             if (!paused()) {
                 _pause();
@@ -102,6 +110,9 @@ contract MorphoFlashLoanV2 is Ownable, Pausable {
             }
         }
 
+=======
+        paused = status;
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
         emit Events.Paused(status);
     }
 
@@ -141,7 +152,11 @@ contract MorphoFlashLoanV2 is Ownable, Pausable {
     )
         external
         onlyEngine
+<<<<<<< HEAD
         onlyWhenNotPaused
+=======
+        whenNotPaused
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
     {
 
 
@@ -199,7 +214,11 @@ contract MorphoFlashLoanV2 is Ownable, Pausable {
     )
         external
         onlyMorpho
+<<<<<<< HEAD
         onlyWhenNotPaused
+=======
+        whenNotPaused
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
     {
 
 
@@ -311,17 +330,24 @@ contract MorphoFlashLoanV2 is Ownable, Pausable {
     {
 
         if(
+<<<<<<< HEAD
             token == address(0)
         )
             revert Errors.InvalidToken();
 
         if(
+=======
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
             token == flashToken
         )
             revert Errors.InProgress();
 
 
+<<<<<<< HEAD
         uint256 balance =
+=======
+        uint256 amount =
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
             IERC20(token)
             .balanceOf(
                 address(this)

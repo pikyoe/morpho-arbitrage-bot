@@ -7,7 +7,11 @@ async function main() {
   const { ethers } = connection;
 
   loadEnvForNetwork(hre);
+<<<<<<< HEAD
   ensureChain([8453n, 31337n, 84532n], connection);
+=======
+  ensureChain(8453n);
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
 
   const [deployer] = await ethers.getSigners();
   const networkName = (hre.network as any).name ?? "unknown";
@@ -25,8 +29,12 @@ async function main() {
     throw new Error("Invalid UNISWAP_ROUTER_ADDRESS");
   }
 
+<<<<<<< HEAD
   // For now, use deployer address as placeholder for engine (will be set later)
   const adapter = await Factory.deploy(deployer.address, router, deployer.address);
+=======
+  const adapter = await Factory.deploy(deployer.address, router);
+>>>>>>> 12717916c10abdf9ee40368b4eb46062d6add995
 
     await adapter.waitForDeployment();
 
