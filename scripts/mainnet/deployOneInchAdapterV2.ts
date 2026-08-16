@@ -2,9 +2,10 @@ import hre from "hardhat";
 import loadEnvForNetwork from "../utils/loadEnv.js";
 import { ensureChain } from "../utils/validateNetwork.js";
 
-// 1inch AggregationRouterV6 — same canonical address on every EVM chain.
-// Override with INCH_ROUTER_ADDRESS in the env file if it ever differs.
-const INCH_ROUTER_DEFAULT = "0x1111111254EEB2542B083cd3d89929cA9e0d33F3";
+// 1inch AggregationRouterV6 — same canonical address on every EVM chain
+// (EIP-55 checksummed). Override with INCH_ROUTER_ADDRESS in the env file if
+// it ever differs.
+const INCH_ROUTER_DEFAULT = "0x1111111254EEB2542b083CD3d89929CA9e0D33F3";
 
 async function main() {
   const connection: any = await hre.network.connect();
@@ -30,21 +31,24 @@ async function main() {
     throw new Error("ARBITRAGE_ENGINE_V2_ADDRESS is missing or invalid");
   }
 
+  // Normalize to the EIP-55 checksum form so lowercase/mixed-case env values work.
+  const routerChecksummed = ethers.getAddress(router);
+
   console.log("Network:", networkName);
   console.log("Chain ID:", chainId);
   console.log("Signer:", deployer.address);
   console.log("Owner:", owner);
-  console.log("Router:", router);
+  console.log("Router:", routerChecksummed);
   console.log("Engine:", engine);
 
   const Factory = await ethers.getContractFactory("OneInchAdapterV2");
-  const adapter = await Factory.deploy(owner, router, engine);
+  const adapter = await Factory.deploy(owner, routerChecksummed, engine);
   await adapter.waitForDeployment();
 
   console.log("OneInchAdapterV2:", await adapter.getAddress());
   console.log("Next steps:");
   console.log("  1. Add the adapter address to .env.mainnet as INCH_ADAPTER_V2_ADDRESS");
-  console.log("  2. Approve it on the engine: ADAPTER_ADDRESS=<addr> DRY_RUN=false npx tsx scripts/mainnet/setApprovedAdapterV2.ts");
+  console.log("  2. Approve it on the engine: npx hardhat run scripts/mainnet/setApprovedAdapterV2.ts --network base");
 }
 
 main().catch((error) => {
