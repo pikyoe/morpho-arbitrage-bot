@@ -14,6 +14,16 @@ async function main() {
   loadEnvForNetwork(hre);
   await ensureChain([8453n, 31337n, 84532n], connection);
 
+  // Safety net: hardhat's configured chainId can disagree with the live RPC
+  // (e.g. BASE_RPC_URL pointing at a Sepolia endpoint). The RPC is the truth.
+  const liveChainId = BigInt((await connection.provider.getNetwork()).chainId);
+  const configuredChainId = BigInt((hre.network as any).config?.chainId ?? liveChainId);
+  if (configuredChainId !== liveChainId) {
+    console.warn("⚠️⚠️⚠️ CONFIG CHAIN ID MISMATCH ⚠️⚠️⚠️");
+    console.warn(`   Hardhat config says chainId ${configuredChainId}, but the live RPC says ${liveChainId}.`);
+    console.warn("   This deploy will go to the LIVE RPC chain. Check BASE_RPC_URL in the env file!");
+  }
+
   const [deployer] = await ethers.getSigners();
   const networkName = (hre.network as any).name ?? "unknown";
   const chainId = (hre.network as any).config?.chainId ?? "unknown";
@@ -35,7 +45,7 @@ async function main() {
   const routerChecksummed = ethers.getAddress(router);
 
   console.log("Network:", networkName);
-  console.log("Chain ID:", chainId);
+  console.log("Chain ID (live RPC):", liveChainId.toString());
   console.log("Signer:", deployer.address);
   console.log("Owner:", owner);
   console.log("Router:", routerChecksummed);
@@ -48,7 +58,8 @@ async function main() {
   console.log("OneInchAdapterV2:", await adapter.getAddress());
   console.log("Next steps:");
   console.log("  1. Add the adapter address to .env.mainnet as INCH_ADAPTER_V2_ADDRESS");
-  console.log("  2. Approve it on the engine: npx hardhat run scripts/mainnet/setApprovedAdapterV2.ts --network base");
+  console.log("  2. Approve it on the engine (reads INCH_ADAPTER_V2_ADDRESS, sends the tx):");
+  console.log("     DRY_RUN=false npx hardhat run scripts/mainnet/setApprovedAdapterV2.ts --network base");
 }
 
 main().catch((error) => {

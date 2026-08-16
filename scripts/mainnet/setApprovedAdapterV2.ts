@@ -15,7 +15,9 @@ async function main() {
 
   const [signer] = await ethers.getSigners();
   const engineAddress = process.env.ARBITRAGE_ENGINE_V2_ADDRESS;
-  const adapterAddress = process.env.ADAPTER_ADDRESS;
+  // ADAPTER_ADDRESS wins when set; INCH_ADAPTER_V2_ADDRESS is a convenient
+  // fallback so the 1inch adapter can be approved without extra env vars.
+  const adapterAddress = process.env.ADAPTER_ADDRESS || process.env.INCH_ADAPTER_V2_ADDRESS;
   const approved = process.env.ADAPTER_APPROVED !== "false";
   const dryRun = process.env.DRY_RUN !== "false";
 
@@ -23,7 +25,7 @@ async function main() {
     throw new Error("ARBITRAGE_ENGINE_V2_ADDRESS is missing or invalid");
   }
   if (!adapterAddress || !ethers.isAddress(adapterAddress) || adapterAddress === ethers.ZeroAddress) {
-    throw new Error("ADAPTER_ADDRESS is missing or invalid");
+    throw new Error("ADAPTER_ADDRESS (or INCH_ADAPTER_V2_ADDRESS) is missing or invalid");
   }
 
   const engine = new ethers.Contract(engineAddress, ENGINE_ABI, signer);
