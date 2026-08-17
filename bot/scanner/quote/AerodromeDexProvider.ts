@@ -64,8 +64,7 @@ export class AerodromeDexProvider implements DexQuoteProvider {
                     factory: this.factoryAddress,
                     reserve0Raw: reserves[0].toString(),
                     reserve1Raw: reserves[1].toString(),
-                    liquiditySource: "rpc",
-                    liquidityUpdatedBlock: await this.provider.getBlockNumber()
+                    liquiditySource: "rpc"
                 });
                 await quoteRateLimiter.wait();
                 const routes = [{

@@ -142,7 +142,9 @@ export class OneInchAggregator {
 
             const response = await fetch(url, {
                 method: 'GET',
-                headers: this.getHeaders()
+                headers: this.getHeaders(),
+                // Never let a hanging 1inch request stall the whole scan loop.
+                signal: AbortSignal.timeout(5000)
             });
 
             if (!response.ok) {
@@ -189,6 +191,10 @@ export class OneInchAggregator {
         slippage: number = 100,
         options: { receiver?: string; deadline?: number } = {}
     ): Promise<any | null> {
+        if (!this.isEnabled()) {
+            return null;
+        }
+
         try {
             // Rate limit 1inch API calls to stay within the free-tier quota.
             await oneInchRateLimiter.wait();
@@ -197,15 +203,26 @@ export class OneInchAggregator {
 
             const response = await fetch(url, {
                 method: 'GET',
-                headers: this.getHeaders()
+                headers: this.getHeaders(),
+                // Never let a hanging 1inch request stall the whole scan loop.
+                signal: AbortSignal.timeout(5000)
             });
 
             if (!response.ok) {
+                this.handleFailure(`http-${response.status}`);
                 return null;
             }
 
-            return await response.json();
+            const data: any = await response.json();
+            if (!data?.tx?.data) {
+                this.handleFailure("invalid-swap-response");
+                return null;
+            }
+
+            this.consecutiveFailures = 0;
+            return data;
         } catch (error) {
+            this.handleFailure("request-exception");
             return null;
         }
     }
@@ -228,7 +245,8 @@ export class OneInchAggregator {
 
             const response = await fetch(url, {
                 method: 'GET',
-                headers: this.getHeaders()
+                headers: this.getHeaders(),
+                signal: AbortSignal.timeout(5000)
             });
 
             return response.ok;
