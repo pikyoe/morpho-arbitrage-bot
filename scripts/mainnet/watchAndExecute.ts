@@ -22,7 +22,7 @@ import { QuoteRequest, QuoteResult } from "../../bot/scanner/quote/index.js";
 import { OneInchAggregator } from "../../bot/scanner/aggregator/OneInchAggregator.js";
 import { AdapterRegistry } from "../../bot/registry/AdapterRegistry.js";
 import { FlashLoanExecutor } from "../../bot/executor/FlashLoanExecutor.js";
-import { TOKEN_DECIMALS, TOKENS } from "../../bot/scanner/TokenList.js";
+import { TOKEN_DECIMALS, TOKENS, tokenSymbol } from "../../bot/scanner/TokenList.js";
 import { TIER_1_TOKENS, TIER_2_TOKENS } from "../../bot/scanner/TokenUniverse.js";
 import { toUniquePairs, batchPairs, filterPairs } from "../../bot/scanner/UniversalPairFilter.js";
 import { getTokenPriceUSD } from "../../bot/utils/USDAmountConverter.js";
@@ -766,9 +766,20 @@ async function main() {
     console.log("🚀 Spread Monitor + Auto-Execute");
     console.log("=================================");
     if (WATCH_MODE === "list") {
-        console.log(`Pairs: ${WATCH_PAIRS_CSV}`);
+        // Show readable token names (VIRTUAL/WETH; AERO/WETH; …) instead of raw
+        // addresses; unknown tokens fall back to a short address form.
+        const pairsLabel = WATCH_PAIRS_CSV
+            .split(";")
+            .map(part => part.trim())
+            .filter(Boolean)
+            .map(part => {
+                const [a, b] = part.split(",").map(s => s.trim());
+                return `${tokenSymbol(a)}/${tokenSymbol(b)}`;
+            })
+            .join("; ");
+        console.log(`Pairs: ${pairsLabel}`);
     } else {
-        console.log(`Pair: ${WATCH_PAIR_A.slice(0,6)} ↔ ${WATCH_PAIR_B.slice(0,6)}`);
+        console.log(`Pair: ${tokenSymbol(WATCH_PAIR_A)} ↔ ${tokenSymbol(WATCH_PAIR_B)}`);
     }
     const testSizeLabel = TEST_AMOUNT_USD_START < TEST_AMOUNT_USD_MAX
         ? `$${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX} (ladder +$${TEST_AMOUNT_USD_STEP}/loop)`

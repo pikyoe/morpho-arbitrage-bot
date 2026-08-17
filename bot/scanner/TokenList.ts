@@ -91,3 +91,24 @@ export function formatUnits(amount: bigint, decimals: number): string {
 export const TOKEN_ARRAY = Object.values(TOKENS).filter(
     (address): address is string => typeof address === "string" && address.length > 0
 );
+
+// Reverse lookup: lowercase address -> token symbol, for readable logs.
+// Built from TOKENS plus a few known extras (ENA, WBTC) that exist in
+// TOKEN_DECIMALS but not in the TOKENS map.
+const TOKEN_SYMBOLS: Record<string, string> = (() => {
+    const map: Record<string, string> = {};
+    for (const [symbol, address] of Object.entries(TOKENS)) {
+        if (typeof address === "string" && address) {
+            map[address.toLowerCase()] = symbol;
+        }
+    }
+    // Known Base tokens missing from TOKENS above
+    map["0x58538e6a46e07434d7e7375bc268d3cb839c0133"] = "ENA";
+    map["0x0555e30da8f98308edb960aa94c0db47230d2b9c"] = "WBTC";
+    return map;
+})();
+
+/** Human-readable symbol for a token address (falls back to a short address). */
+export function tokenSymbol(address: string): string {
+    return TOKEN_SYMBOLS[address.toLowerCase()] ?? `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
