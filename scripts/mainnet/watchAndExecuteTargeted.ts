@@ -57,7 +57,6 @@ if (process.env.TARGETED_ALLOW_RPC_POOL_DISCOVERY === "true") {
 process.env.WATCH_ENABLE_EXECUTION ||= "false";
 
 console.log("🎯 Targeted watcher configuration");
-console.log(`Pairs: ${process.env.WATCH_PAIRS}`);
 console.log(`Execution: ${process.env.WATCH_ENABLE_EXECUTION}`);
 if (process.env.INCH_API_KEY && process.env.INCH_API_BASE_URL) {
     console.log(`1inch API: enabled (${process.env.INCH_API_BASE_URL})`);
