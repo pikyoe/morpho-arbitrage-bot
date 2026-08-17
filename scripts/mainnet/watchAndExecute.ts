@@ -6,7 +6,8 @@ import {
     Contract,
     AbiCoder,
     parseUnits,
-    formatUnits
+    formatUnits,
+    getAddress
 } from "ethers";
 
 import { PoolCache } from "../../bot/scanner/PoolCache.js";
@@ -63,6 +64,10 @@ const MAX_PAIRS_PER_SCAN = Number(process.env.MAX_PAIRS_PER_SCAN || 200);
 const TOP_N_CANDIDATES = Number(process.env.TOP_N_CANDIDATES || 5);
 const TEST_AMOUNT_USD = Number(process.env.WATCH_TEST_USD || 1000); // Quote size in USD
 const SPREAD_THRESHOLD_PCT = Number(process.env.SPREAD_THRESHOLD_PCT || 0.2); // e.g. 0.2%
+// A candidate whose route includes a 1inch leg must clear this higher spread
+// floor: 1inch charges an aggregator fee (~0.35%), so a smaller "spread"
+// against 1inch is usually the aggregator fee itself, not real profit.
+const INCH_LEG_MIN_SPREAD_PCT = Number(process.env.INCH_LEG_MIN_SPREAD_PCT || 0.5);
 const MIN_NET_PROFIT_USD = Number(process.env.MIN_NET_PROFIT_USD || 1);
 // Same-direction quotes use identical token units. Extreme outliers are
 // generally stale/invalid pools (for example a dust quote), not real spread.
@@ -176,6 +181,13 @@ function hasEngineAdapter(dex: string, registry: AdapterRegistry): boolean {
     } catch {
         return false;
     }
+}
+
+/** Effective spread threshold for a candidate route. A 1inch leg must clear a
+ *  higher floor so the aggregator fee (~0.35%) cannot masquerade as profit. */
+function spreadThresholdFor(forward: { dex: string }, reverse: { dex: string }): number {
+    const hasInchLeg = forward.dex === "1INCH" || reverse.dex === "1INCH";
+    return hasInchLeg ? Math.max(SPREAD_THRESHOLD_PCT, INCH_LEG_MIN_SPREAD_PCT) : SPREAD_THRESHOLD_PCT;
 }
 
 function buildDexProviders(): DexQuoteProvider[] {
@@ -373,8 +385,10 @@ function filterQuoteOutliers<T extends { q: QuoteResult }>(quotes: T[], label: s
 // ------------------------------------------------------------------
 // Multi-pair scan helpers (WATCH_MODE = all | list)
 // ------------------------------------------------------------------
+const WATCH_PAIR_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
+
 function parseWatchPairs(csv: string): { tokenA: string; tokenB: string }[] {
-    return csv
+    const pairs = csv
         .split(";")
         .map(part => part.trim())
         .filter(Boolean)
@@ -383,6 +397,23 @@ function parseWatchPairs(csv: string): { tokenA: string; tokenB: string }[] {
             return { tokenA: a, tokenB: b };
         })
         .filter(p => p.tokenA && p.tokenB);
+    // Fail fast on malformed addresses: a typo in WATCH_PAIRS would otherwise
+    // silently drop every quote for that pair and be very hard to trace.
+    const invalid = pairs.filter(p => !WATCH_PAIR_ADDRESS_RE.test(p.tokenA) || !WATCH_PAIR_ADDRESS_RE.test(p.tokenB));
+    if (invalid.length > 0) {
+        throw new Error(
+            `Invalid token address in WATCH_PAIRS: ${invalid.map(p => `${p.tokenA},${p.tokenB}`).join(" | ")} (expected 0x-prefixed 40-hex addresses, format 0xAAA,0xBBB;0xCCC,0xDDD)`
+        );
+    }
+    // Normalize to EIP-55 checksum (all-lowercase/uppercase are accepted and
+    // re-encoded; mixed-case with a wrong checksum fails with a clear error).
+    return pairs.map(p => {
+        try {
+            return { tokenA: getAddress(p.tokenA), tokenB: getAddress(p.tokenB) };
+        } catch (e: any) {
+            throw new Error(`Invalid token address in WATCH_PAIRS (${p.tokenA},${p.tokenB}): ${e?.shortMessage || e?.message || String(e)}`);
+        }
+    });
 }
 
 function resolveScanPairs(): { tokenA: string; tokenB: string }[] {
@@ -1003,8 +1034,9 @@ async function main() {
             statsSpreads++;
 
             // Threshold checks (same as single mode)
-            if (spreadPct < SPREAD_THRESHOLD_PCT) {
-                if (VERBOSE) console.log(`  Below threshold ${SPREAD_THRESHOLD_PCT}%, skipping`);
+            const threshold = spreadThresholdFor(forward, reverse);
+            if (spreadPct < threshold) {
+                if (VERBOSE) console.log(`  Below threshold ${threshold}%${threshold > SPREAD_THRESHOLD_PCT ? " (1INCH leg)" : ""}, skipping`);
                 await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
                 continue;
             }
@@ -1198,8 +1230,9 @@ async function main() {
         statsSpreads++;
 
         // Threshold check
-        if (spreadPct < SPREAD_THRESHOLD_PCT) {
-            if (VERBOSE) console.log(`  Below threshold ${SPREAD_THRESHOLD_PCT}%, skipping`);
+        const threshold = spreadThresholdFor(forward, reverse);
+        if (spreadPct < threshold) {
+            if (VERBOSE) console.log(`  Below threshold ${threshold}%${threshold > SPREAD_THRESHOLD_PCT ? " (1INCH leg)" : ""}, skipping`);
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
             continue;
         }
