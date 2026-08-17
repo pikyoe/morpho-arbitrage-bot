@@ -71,6 +71,10 @@ const POLL_INTERVAL_MS = Number(process.env.WATCH_POLL_MS || 5000); // 5s defaul
 const MAX_LOAN_USD = Number(process.env.WATCH_MAX_LOAN_USD || 10000);
 // Fail closed: execution requires an explicit WATCH_ENABLE_EXECUTION=true.
 const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION === "true"; // default OFF
+// After a failed execution attempt, the same route (token pair + DEX combo) is
+// blocked from re-executing for this long, so a persistent-but-unexecutable
+// spread cannot burn gas on repeated reverts.
+const EXECUTION_COOLDOWN_MS = Math.max(0, Number(process.env.EXECUTION_COOLDOWN_MS || 60000));
 // Slippage tolerance: default 0.1%, clamped to [0.1%, 1.5%] — never defaults to the max.
 const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.1), 0.1), 1.5);
 // minProfit floor: keep this % of the quoted profit on-chain (clamped 10–90%).
@@ -85,7 +89,6 @@ const VERBOSE = process.env.WATCH_VERBOSE === "true";
 // deployed OneInchAdapterV2 address in INCH_ADAPTER_V2_ADDRESS; without it the
 // 1inch legs are detection-only.
 const USE_1INCH = process.env.WATCH_USE_1INCH !== "false";
-const GENERAL_DEX_NAMES = ["UniswapV3", "SushiSwap", "PancakeSwap"];
 // Test-size ladder: start at WATCH_TEST_USD_START, ramp by WATCH_TEST_USD_STEP
 // every WATCH_TEST_USD_RAMP_LOOPS scan loops up to WATCH_TEST_USD (the max),
 // then cycle back to the start. Thin pools are probed at small sizes (sane
@@ -438,8 +441,7 @@ function pairRejectReason(pair: { tokenA: string; tokenB: string }): string {
 async function scanAllPairs(
     pairs: { tokenA: string; tokenB: string }[],
     dexProviders: DexQuoteProvider[],
-    amountInForToken: (token: string) => Promise<bigint>,
-    formatAmount: (amount: bigint, addr: string) => Promise<string>
+    amountInForToken: (token: string) => Promise<bigint>
 ): Promise<any[]> {
     const filtered = filterPairs(pairs as any, {
         minLiquidityUSD: MIN_LIQUIDITY_USD,
@@ -483,14 +485,19 @@ async function scanAllPairs(
                     const amountIn = await amountInForToken(pair.tokenA);
                     if (amountIn <= 0n) return null;
 
-                    // Phase 1: quote A→B on every DEX (plus the 1inch aggregate).
-                    const buyQuotes: { dex: string; q: QuoteResult }[] = [];
-                    for (const dex of dexProviders) {
-                        const qBuy = await quoteOn(dex, pair.tokenA, pair.tokenB, amountIn);
-                        if (qBuy) buyQuotes.push({ dex: dex.getDexName(), q: qBuy });
-                    }
-                    const qInchBuy = await quoteOneInch({ tokenIn: pair.tokenA, tokenOut: pair.tokenB, amountIn });
-                    if (qInchBuy) buyQuotes.push({ dex: "1INCH", q: qInchBuy });
+                    // Phase 1: quote A→B on every DEX (plus the 1inch aggregate),
+                    // all sources in parallel so per-pair latency ≈ one round trip.
+                    const [dexBuyQuotes, qInchBuy] = await Promise.all([
+                        Promise.all(dexProviders.map(async (dex) => {
+                            const qBuy = await quoteOn(dex, pair.tokenA, pair.tokenB, amountIn);
+                            return qBuy ? { dex: dex.getDexName(), q: qBuy } : null;
+                        })),
+                        quoteOneInch({ tokenIn: pair.tokenA, tokenOut: pair.tokenB, amountIn })
+                    ]);
+                    const buyQuotes: { dex: string; q: QuoteResult }[] = [
+                        ...dexBuyQuotes.filter((x): x is { dex: string; q: QuoteResult } => x !== null),
+                        ...(qInchBuy ? [{ dex: "1INCH", q: qInchBuy }] : [])
+                    ];
                     const saneBuyQuotes = filterQuoteOutliers(buyQuotes, "buy");
                     if (saneBuyQuotes.length < 2) {
                         return null;
@@ -502,14 +509,18 @@ async function scanAllPairs(
                     const buyAmountOut = bestBuy.q.amountOut;
 
                     // Phase 2: quote B→A on every DEX (plus the 1inch aggregate)
-                    // using the SAME buyAmountOut.
-                    const sellQuotes: { dex: string; q: QuoteResult }[] = [];
-                    for (const dex of dexProviders) {
-                        const qSell = await quoteOn(dex, pair.tokenB, pair.tokenA, buyAmountOut);
-                        if (qSell) sellQuotes.push({ dex: dex.getDexName(), q: qSell });
-                    }
-                    const qInchSell = await quoteOneInch({ tokenIn: pair.tokenB, tokenOut: pair.tokenA, amountIn: buyAmountOut });
-                    if (qInchSell) sellQuotes.push({ dex: "1INCH", q: qInchSell });
+                    // using the SAME buyAmountOut, all sources in parallel.
+                    const [dexSellQuotes, qInchSell] = await Promise.all([
+                        Promise.all(dexProviders.map(async (dex) => {
+                            const qSell = await quoteOn(dex, pair.tokenB, pair.tokenA, buyAmountOut);
+                            return qSell ? { dex: dex.getDexName(), q: qSell } : null;
+                        })),
+                        quoteOneInch({ tokenIn: pair.tokenB, tokenOut: pair.tokenA, amountIn: buyAmountOut })
+                    ]);
+                    const sellQuotes: { dex: string; q: QuoteResult }[] = [
+                        ...dexSellQuotes.filter((x): x is { dex: string; q: QuoteResult } => x !== null),
+                        ...(qInchSell ? [{ dex: "1INCH", q: qInchSell }] : [])
+                    ];
                     const saneSellQuotes = filterQuoteOutliers(sellQuotes, "sell");
 
                     // Best round-trip: buy at bestBuy.dex, sell at the best cross-DEX.
@@ -619,10 +630,21 @@ async function buildOpportunity(
     // 1inch legs need an exact input amount (their calldata is amount-specific),
     // so the reverse 1inch leg uses the amount its quote was built for instead of
     // 0. DEX legs keep 0 so ArbitrageEngineV2 fills in the actual first-leg output.
-    const reverseAmountIn = reverse.dex === "1INCH" ? reverse.amountIn : 0n;
+    //
+    // The reverse 1inch amount is discounted by the slippage tolerance: if the
+    // first (DEX) leg delivers slightly less than the quoted amount, the engine's
+    // balance check (amountIn > balance → revert) tolerates a shortfall up to
+    // SLIPPAGE_PCT instead of reverting the whole transaction and burning gas.
+    const slippageBps = BigInt(Math.round(SLIPPAGE_PCT * 100));
+    const reverseExactIn = reverse.dex === "1INCH"
+        ? (reverse.amountIn * (1000n - slippageBps)) / 1000n
+        : 0n;
+    const reverseMinOut = reverse.dex === "1INCH" && reverse.amountIn > 0n
+        ? slip((reverse.amountOut * reverseExactIn) / reverse.amountIn)
+        : slip(reverse.amountOut);
     const steps = [
         await buildStep(forward, amountIn, slip(forward.amountOut)),
-        await buildStep(reverse, reverseAmountIn, slip(reverse.amountOut))
+        await buildStep(reverse, reverseExactIn, reverseMinOut)
     ];
 
     // Net profit in USD: raw profit → token units → USD. Use the
@@ -694,6 +716,17 @@ async function main() {
         printSummary();
         process.exit(0);
     });
+
+    // Execution cooldown: after a failed execution attempt, block re-execution
+    // of the same route (token pair + DEX combo) for EXECUTION_COOLDOWN_MS so a
+    // persistent-but-unexecutable spread cannot burn gas on repeated reverts.
+    const lastExecutionFailAt = new Map<string, number>();
+    const routeKey = (tokenA: string, forwardDex: string, reverseDex: string): string =>
+        `${tokenA.toLowerCase()}|${forwardDex}|${reverseDex}`;
+    const inExecutionCooldown = (key: string): boolean => {
+        const failedAt = lastExecutionFailAt.get(key);
+        return failedAt !== undefined && Date.now() - failedAt < EXECUTION_COOLDOWN_MS;
+    };
 
     const network = await provider.getNetwork();
     if (network.chainId !== 8453n) {
@@ -955,7 +988,7 @@ async function main() {
                 }
             }
 
-            const topCandidates = await scanAllPairs(scanPairs, dexProviders, amountFor, formatAmount);
+            const topCandidates = await scanAllPairs(scanPairs, dexProviders, amountFor);
             const best = topCandidates[0] ?? null;
 
             if (!best || best.netProfitUSD <= 0) {
@@ -994,6 +1027,13 @@ async function main() {
                 continue;
             }
 
+            const cooldownKey = routeKey(tokenA, forward.dex, reverse.dex);
+            if (inExecutionCooldown(cooldownKey)) {
+                console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping execution`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
+            }
+
             let opp: any;
             try {
                 opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
@@ -1023,21 +1063,31 @@ async function main() {
             }
 
             console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
+            let executed = false;
             try {
                 const result = await executor.executeFlashLoan(opp);
                 if (result.success) {
                     console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
                     statsExecuted++;
+                    executed = true;
+                    lastExecutionFailAt.delete(cooldownKey);
                 } else {
                     console.log(`  ❌ Execution failed: ${result.error}`);
                     statsFailed++;
                 }
             } catch (e: any) {
                 console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
+                statsFailed++;
             }
 
-            // Rescan immediately after an execution attempt — the spread may
-            // still be live and the next quote decides whether to act again.
+            if (!executed) {
+                // Failed/reverted execution: cooldown the route and pause before
+                // the next scan so a persistent failure cannot loop and burn gas.
+                lastExecutionFailAt.set(cooldownKey, Date.now());
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            }
+            // On success, rescan immediately — the spread may still be live and
+            // the next quote decides whether to act again.
             continue;
         }
 
@@ -1059,12 +1109,16 @@ async function main() {
         // Quote token A -> token B (buy) on every DEX
         const buyQuotes: { dex: string; q: QuoteResult }[] = [];
 
-        for (const dex of dexProviders) {
-            const qBuy = await quoteOn(dex, WATCH_PAIR_A, WATCH_PAIR_B, amountIn);
-            if (qBuy) buyQuotes.push({ dex: dex.getDexName(), q: qBuy });
-
+        const [dexBuyQuotes, qInchBuy] = await Promise.all([
+            Promise.all(dexProviders.map(async (dex) => {
+                const qBuy = await quoteOn(dex, WATCH_PAIR_A, WATCH_PAIR_B, amountIn);
+                return qBuy ? { dex: dex.getDexName(), q: qBuy } : null;
+            })),
+            quoteOneInch({ tokenIn: WATCH_PAIR_A, tokenOut: WATCH_PAIR_B, amountIn })
+        ]);
+        for (const q of dexBuyQuotes) {
+            if (q) buyQuotes.push(q);
         }
-        const qInchBuy = await quoteOneInch({ tokenIn: WATCH_PAIR_A, tokenOut: WATCH_PAIR_B, amountIn });
         if (qInchBuy) buyQuotes.push({ dex: "1INCH", q: qInchBuy });
         // Same outlier guard as multi-pair mode: drop stale/dust quotes so a
         // phantom spread cannot trigger a gas-burning execution attempt.
@@ -1094,15 +1148,22 @@ async function main() {
         // (In practice for monitoring, quoting both directions on each dex and comparing
         //  the implied rate is sufficient to detect large cross-DEX discrepancies.)
         for (const buy of saneBuyQuotes) {
-            const sellQuotes: { dex: string; q: QuoteResult }[] = [];
-            for (const sellDex of dexProviders) {
-                if (buy.dex === sellDex.getDexName()) continue;
-                const sellQuote = await quoteOn(sellDex, WATCH_PAIR_B, WATCH_PAIR_A, buy.q.amountOut);
-                if (sellQuote) sellQuotes.push({ dex: sellDex.getDexName(), q: sellQuote });
-            }
-            // 1inch as the reverse leg (skipped when 1inch was already the buy leg).
-            const qInchSell = await quoteOneInch({ tokenIn: WATCH_PAIR_B, tokenOut: WATCH_PAIR_A, amountIn: buy.q.amountOut });
-            if (qInchSell && buy.dex !== "1INCH") sellQuotes.push({ dex: "1INCH", q: qInchSell });
+            // Quote every sell source in parallel for this buy leg.
+            const [dexSellQuotes, qInchSell] = await Promise.all([
+                Promise.all(dexProviders.map(async (sellDex) => {
+                    if (buy.dex === sellDex.getDexName()) return null;
+                    const sellQuote = await quoteOn(sellDex, WATCH_PAIR_B, WATCH_PAIR_A, buy.q.amountOut);
+                    return sellQuote ? { dex: sellDex.getDexName(), q: sellQuote } : null;
+                })),
+                // 1inch as the reverse leg (skipped when 1inch was already the buy leg).
+                buy.dex !== "1INCH"
+                    ? quoteOneInch({ tokenIn: WATCH_PAIR_B, tokenOut: WATCH_PAIR_A, amountIn: buy.q.amountOut })
+                    : Promise.resolve(null)
+            ]);
+            const sellQuotes: { dex: string; q: QuoteResult }[] = [
+                ...dexSellQuotes.filter((x): x is { dex: string; q: QuoteResult } => x !== null),
+                ...(qInchSell && buy.dex !== "1INCH" ? [{ dex: "1INCH", q: qInchSell }] : [])
+            ];
             for (const sell of filterQuoteOutliers(sellQuotes, "sell")) {
                 const amountBack = sell.q.amountOut; // in token A
                 if (amountBack <= amountIn) continue;
@@ -1163,6 +1224,13 @@ async function main() {
             continue;
         }
 
+        const cooldownKey = routeKey(WATCH_PAIR_A, forward.dex, reverse.dex);
+        if (inExecutionCooldown(cooldownKey)) {
+            console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping execution`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
+        }
+
         // Build opportunity & execute
         const profit = reverse.amountOut - amountIn;
         let opp: any;
@@ -1196,20 +1264,28 @@ async function main() {
         }
 
         console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
+        let executed = false;
         try {
             const result = await executor.executeFlashLoan(opp);
             if (result.success) {
                 console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
                 statsExecuted++;
+                executed = true;
+                lastExecutionFailAt.delete(cooldownKey);
             } else {
                 console.log(`  ❌ Execution failed: ${result.error}`);
                 statsFailed++;
             }
         } catch (e: any) {
             console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
+            statsFailed++;
         }
 
-        // Rescan immediately after an execution attempt (see multi-pair mode).
+        if (!executed) {
+            lastExecutionFailAt.set(cooldownKey, Date.now());
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        }
+        // On success, rescan immediately (see multi-pair mode).
     }
 }
 

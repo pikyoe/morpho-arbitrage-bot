@@ -32,6 +32,10 @@ process.env.TOP_N_CANDIDATES ||= "1";
 process.env.WATCH_POOL_REFRESH_LOOPS ||= "12";
 process.env.WATCH_TEST_USD ||= "500";
 process.env.WATCH_POLL_MS ||= "5000";
+// Deeper subgraph pool list so the fixed pairs (e.g. CBBTC/USDC) are usually
+// present in the cache even when they sit outside the top-20 pools — without
+// spending any RPC budget (subgraph queries are GraphQL).
+process.env.SUBGRAPH_POOL_LIMIT ||= "50";
 process.env.MIN_DEX_VARIETY ||= "2";
 // Low-RPC watcher: use the 1inch API (INCH_API_KEY/INCH_API_BASE_URL) as an
 // additional aggregated quote source for spread detection.
