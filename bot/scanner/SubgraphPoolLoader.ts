@@ -23,6 +23,11 @@ const ANCHOR_TOKENS = [
 ].map(addr => addr.toLowerCase());
 
 const DEFAULT_POOL_LIMIT = 50;
+
+// Set SUBGRAPH_VERBOSE=true to log every raw pool row during subgraph loading.
+// Off by default: per-pool rows are extremely noisy (one line per pool) and the
+// subgraph URL line would also print the Graph API key into the watcher logs.
+const SUBGRAPH_VERBOSE = process.env.SUBGRAPH_VERBOSE === "true";
 const TRIANGLE_POOL_LIMIT = 500; // Higher limit for triangle discovery
 const MIN_VOLUME_USD = 1000; // $1K minimum for triangle discovery
 const MAX_VOLUME_USD = 1000000000; // Very high
@@ -313,7 +318,9 @@ export class SubgraphPoolLoader {
         subgraphUrl: string,
         topPools: number = DEFAULT_POOL_LIMIT
     ): Promise<void> {
-        console.log(`[SushiSwap] Loading pools from ${subgraphUrl}`);
+        if (SUBGRAPH_VERBOSE) {
+            console.log(`[SushiSwap] Loading pools from ${subgraphUrl}`);
+        }
         
         let response = await this.querySubgraph(
             subgraphUrl,
@@ -407,7 +414,9 @@ export class SubgraphPoolLoader {
         subgraphUrl: string,
         topPools: number = DEFAULT_POOL_LIMIT
     ): Promise<void> {
-        console.log(`[Aerodrome] Loading pools from ${subgraphUrl}`);
+        if (SUBGRAPH_VERBOSE) {
+            console.log(`[Aerodrome] Loading pools from ${subgraphUrl}`);
+        }
         
         const response = await this.querySubgraph(
             subgraphUrl,
@@ -847,7 +856,9 @@ export class SubgraphPoolLoader {
         subgraphUrl: string,
         topPools: number = DEFAULT_POOL_LIMIT
     ): Promise<void> {
-        console.log(`[PancakeSwap] Loading pools from ${subgraphUrl}`);
+        if (SUBGRAPH_VERBOSE) {
+            console.log(`[PancakeSwap] Loading pools from ${subgraphUrl}`);
+        }
         
         const result = await this.querySubgraph(
             subgraphUrl,
@@ -879,19 +890,23 @@ export class SubgraphPoolLoader {
                 continue;
             }
 
-            console.log(
-                `[PancakeSwap] RAW POOL: ${pool.id} | ` +
-                `${pool.token0?.id} ↔ ${pool.token1?.id} | ` +
-                `TVL=${pool.totalValueLockedUSD} | ` +
-                `volume=${pool.volumeUSD} | ` +
-                `fee=${pool.feeTier}`
-            );
+            if (SUBGRAPH_VERBOSE) {
+                console.log(
+                    `[PancakeSwap] RAW POOL: ${pool.id} | ` +
+                    `${pool.token0?.id} ↔ ${pool.token1?.id} | ` +
+                    `TVL=${pool.totalValueLockedUSD} | ` +
+                    `volume=${pool.volumeUSD} | ` +
+                    `fee=${pool.feeTier}`
+                );
+            }
 
             if (!this.isEligiblePool(pool)) {
-                console.log(
-                    `[PancakeSwap] FILTERED: ${pool.id} | ` +
-                    `${token0} ↔ ${token1}`
-                );
+                if (SUBGRAPH_VERBOSE) {
+                    console.log(
+                        `[PancakeSwap] FILTERED: ${pool.id} | ` +
+                        `${token0} ↔ ${token1}`
+                    );
+                }
                 continue;
             }
 
