@@ -14,9 +14,13 @@ interface OneInchQuoteResponse {
         decimals: number;
         address: string;
     };
+    // v6.x quote responses report the expected output as dstAmount.
+    // toTokenAmount/toAmount are kept for older API versions.
+    dstAmount?: string | number;
     toTokenAmount?: string | number;
     toAmount?: string | number;
     fromTokenAmount?: string | number;
+    srcAmount?: string | number;
     error?: {
         description?: string;
         message?: string;
@@ -33,7 +37,7 @@ export function parseOneInchQuoteResponse(data: any): { amountOut: bigint } | nu
         return null;
     }
 
-    const rawAmount = data.toTokenAmount ?? data.toAmount;
+    const rawAmount = data.dstAmount ?? data.toTokenAmount ?? data.toAmount;
     if (rawAmount === undefined || rawAmount === null || rawAmount === "") {
         return null;
     }
