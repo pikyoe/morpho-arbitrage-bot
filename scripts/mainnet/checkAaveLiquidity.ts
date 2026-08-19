@@ -20,9 +20,9 @@ const RPC_URL = process.env.BASE_RPC_URL || process.env.RPC_URL;
 if (!RPC_URL) throw new Error("BASE_RPC_URL not set");
 
 // Aave V3 Pool on Base
-const AAVE_POOL = getAddress("0xA238Dd80C259a72e81d7E4664a9801593F98d625");
+const AAVE_POOL = "0xA238dD80C259a72e81d7E4664a9801593F98d625";
 // Aave V3 PoolDataProvider for reserve data
-const AAVE_DATA_PROVIDER = getAddress("0x2d8A3C5677189734FABc2A2081c7b13D43561946");
+const AAVE_DATA_PROVIDER = "0x2d8A3C5677189734FABc2A2081c7b13D43561946";
 
 const POOL_ABI = [
     "function getReserveData(address asset) view returns (tuple(uint256 configuration, uint128 liquidityIndex, uint128 currentLiquidityRate, uint128 variableBorrowIndex, uint128 currentVariableBorrowRate, uint128 currentStableBorrowRate, uint40 lastUpdateTimestamp, uint16 id, address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress, address interestRateStrategyAddress, uint128 accruedToTreasury, uint128 unbacked, uint128 isolationModeTotalDebt))",
@@ -110,7 +110,7 @@ async function main() {
     }
 
     // Specific check for the flash loan amount that failed
-    const WETH_ADDRESS = getAddress("0x4200000000000000000000000000000000000006");
+    const WETH_ADDRESS = "0x4200000000000000000000000000000000000006";
     const FLASH_AMOUNT = 2539841127778112512n; // ~2.54 WETH
 
     console.log();
@@ -141,7 +141,7 @@ async function main() {
     // Morpho comparison
     console.log();
     console.log("--- Comparison with Morpho ---");
-    const MORPHO_FLASHLOAN = getAddress("0x9372a039638Ff82eD316Bc8Ee5f0A888AcE039C8");
+    const MORPHO_FLASHLOAN = "0x9372a039638Ff82eD316Bc8Ee5f0A888AcE039C8";
     const morphoWeth = new Contract(WETH_ADDRESS, ERC20_ABI, provider);
     const morphoBalance = await morphoWeth.balanceOf(MORPHO_FLASHLOAN);
 

@@ -100,7 +100,7 @@ async function main() {
     console.log();
 
     // Specific check for the last failed flash loan amount
-    const WETH_ADDRESS = getAddress("0x4200000000000000000000000000000000000006");
+    const WETH_ADDRESS = "0x4200000000000000000000000000000000000006";
     const FLASH_AMOUNT = 2539841127778112512n; // ~2.54 WETH from the failed tx
 
     const weth = new Contract(WETH_ADDRESS, ERC20_ABI, provider);
