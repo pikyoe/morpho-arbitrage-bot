@@ -7,7 +7,7 @@
  */
 
 import * as dotenv from "dotenv";
-import { JsonRpcProvider, Contract, formatUnits, getAddress } from "ethers";
+import { JsonRpcProvider, Contract, formatUnits } from "ethers";
 
 if (!process.env.ENV_FILE) {
     dotenv.config({ path: ".env.mainnet" });
@@ -37,13 +37,13 @@ const ERC20_ABI = [
 ];
 
 const TOKENS: { name: string; address: string; decimals: number }[] = [
-    { name: "WETH", address: getAddress("0x4200000000000000000000000000000000000006"), decimals: 18 },
-    { name: "USDC", address: getAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), decimals: 6 },
-    { name: "USDbC", address: getAddress("0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"), decimals: 6 },
-    { name: "cbBTC", address: getAddress("0xcbb7c0000ab88b473b1f5afd5782588411511c8c"), decimals: 8 },
-    { name: "AERO", address: getAddress("0x940181a94A35A4569E4529A3CDfB74e38FD98631"), decimals: 18 },
-    { name: "EURC", address: getAddress("0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"), decimals: 6 },
-    { name: "wstETH", address: getAddress("0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"), decimals: 18 },
+    { name: "WETH", address: "0x4200000000000000000000000000000000000006", decimals: 18 },
+    { name: "USDC", address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", decimals: 6 },
+    { name: "USDbC", address: "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", decimals: 6 },
+    { name: "cbBTC", address: "0xcbb7c0000ab88b473b1f5afd5782588411511c8c", decimals: 8 },
+    { name: "AERO", address: "0x940181a94a35a4569e4529a3cdfb74e38fd98631", decimals: 18 },
+    { name: "EURC", address: "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42", decimals: 6 },
+    { name: "wstETH", address: "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452", decimals: 18 },
 ];
 
 async function main() {
