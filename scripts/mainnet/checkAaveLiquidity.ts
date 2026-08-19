@@ -20,9 +20,9 @@ const RPC_URL = process.env.BASE_RPC_URL || process.env.RPC_URL;
 if (!RPC_URL) throw new Error("BASE_RPC_URL not set");
 
 // Aave V3 Pool on Base
-const AAVE_POOL = "0xA238dD80C259a72e81d7E4664a9801593F98d625";
+const AAVE_POOL = "0xa238dd80c259a72e81d7e4664a9801593f98d1c5";
 // Aave V3 PoolDataProvider for reserve data
-const AAVE_DATA_PROVIDER = "0x2d8A3C5677189734FABc2A2081c7b13D43561946";
+const AAVE_DATA_PROVIDER = "0xe20fcbdbffc4dd138ce8b2e6fbb6cb49777ad64d";
 
 const POOL_ABI = [
     "function getReserveData(address asset) view returns (tuple(uint256 configuration, uint128 liquidityIndex, uint128 currentLiquidityRate, uint128 variableBorrowIndex, uint128 currentVariableBorrowRate, uint128 currentStableBorrowRate, uint40 lastUpdateTimestamp, uint16 id, address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress, address interestRateStrategyAddress, uint128 accruedToTreasury, uint128 unbacked, uint128 isolationModeTotalDebt))",
