@@ -38,11 +38,11 @@ const MORPHO_ABI = [
 
 const TOKENS: { name: string; address: string; decimals: number }[] = [
     { name: "WETH", address: "0x4200000000000000000000000000000000000006", decimals: 18 },
-    { name: "USDC", address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", decimals: 6 },
-    { name: "AERO", address: "0x940181a94a35a4569e4529a3cdfb74e38fd98631", decimals: 18 },
+    { name: "USDC", address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals: 6 },
+    { name: "AERO", address: "0x940181a94A35A4569E4529A3CDfB74e38FD98631", decimals: 18 },
     { name: "EURC", address: "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42", decimals: 6 },
-    { name: "VIRTUAL", address: "0x0b3e328455c4059eeb9e3f84b66d6756878677c9", decimals: 18 },
-    { name: "cbBTC", address: "0xcbb7c0000ab88b473b1f5afd5782588411511c8c", decimals: 8 },
+    { name: "VIRTUAL", address: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", decimals: 18 },
+    { name: "cbBTC", address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", decimals: 8 },
 ];
 
 async function main() {
