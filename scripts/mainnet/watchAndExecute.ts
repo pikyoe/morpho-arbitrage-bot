@@ -616,7 +616,9 @@ async function buildOpportunity(
 ): Promise<any> {
     // Apply slippage tolerance to each leg's minimum output (capped at 1.5%).
     const slip = (out: bigint) => (out * (1000n - BigInt(Math.round(SLIPPAGE_PCT * 10)))) / 1000n;
-    const deadline = Math.floor(Date.now() / 1000) + 60;
+    // 300s (matches RouteBuilder): adapters revert when deadline <= block.timestamp,
+    // so a short window turns mild mempool delay into a burned-gas revert.
+    const deadline = Math.floor(Date.now() / 1000) + 300;
 
     const buildStep = async (q: QuoteResult, amountInRaw: bigint, minOut: bigint) => {
         let data: string;

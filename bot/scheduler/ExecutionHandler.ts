@@ -99,15 +99,33 @@ export class ExecutionHandler {
 
             );
 
-        await this.executor.execute(
+        try {
 
-            best.forward.tokenIn,
+            await this.executor.execute(
 
-            best.amountIn,
+                best.forward.tokenIn,
 
-            route
+                best.amountIn,
 
-        );
+                route
+
+            );
+
+        } catch (e: any) {
+
+            // Never let a failed execution kill the scan loop.
+
+            console.error(
+
+                "Execution failed:",
+
+                e?.message || String(e)
+
+            );
+
+            return;
+
+        }
 
         if (best.id) {
 
