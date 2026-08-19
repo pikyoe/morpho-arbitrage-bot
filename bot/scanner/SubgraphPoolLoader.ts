@@ -844,6 +844,11 @@ export class SubgraphPoolLoader {
         }
 
         if (!Array.isArray(pools)) {
+            console.error(
+                `[PancakeSwap] Endpoint has neither \`pools\` nor \`pairs\` — ` +
+                `PANCAKESWAP_SUBGRAPH_URL is misconfigured (unset it to skip this DEX, ` +
+                `or load via RPC like runBot.ts does). Host: ${this.redactUrl(subgraphUrl)}`
+            );
             return;
         }
 
