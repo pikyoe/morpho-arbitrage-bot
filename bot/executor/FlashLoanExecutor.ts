@@ -161,16 +161,16 @@ export class FlashLoanExecutor {
                 };
             }
 
-            // Ultimate fallback
+            // Ultimate fallback — Base gas is very low; 2 gwei wastes budget.
             return {
-                maxFeePerGas: ethers.parseUnits("2", "gwei"),
-                maxPriorityFeePerGas: ethers.parseUnits("1", "gwei")
+                maxFeePerGas: ethers.parseUnits("0.1", "gwei"),
+                maxPriorityFeePerGas: ethers.parseUnits("0.01", "gwei")
             };
         } catch (error) {
             console.error("Failed to get dynamic gas price, using defaults:", error);
             return {
-                maxFeePerGas: ethers.parseUnits("2", "gwei"),
-                maxPriorityFeePerGas: ethers.parseUnits("1", "gwei")
+                maxFeePerGas: ethers.parseUnits("0.1", "gwei"),
+                maxPriorityFeePerGas: ethers.parseUnits("0.01", "gwei")
             };
         }
     }
