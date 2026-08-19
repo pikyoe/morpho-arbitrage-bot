@@ -97,37 +97,9 @@ query tokenPair($token0: String!, $token1: String!) {
 }
 `;
 
+// Note: the SushiSwap subgraph schema for `pools` uses totalValueLockedUSD;
+// reserveUSD only exists on the legacy `pairs` entity (see SUSHISWAP_TOP_PAIRS_QUERY).
 const SUSHISWAP_TOP_POOLS_QUERY = `
-query topPools(
-  $first: Int!,
-  $minReserveUsd: BigDecimal!,
-  $maxReserveUsd: BigDecimal!,
-  $minVolumeUsd: BigDecimal!,
-  $maxVolumeUsd: BigDecimal!
-) {
-  pools(
-    first: $first,
-    orderBy: volumeUSD,
-    orderDirection: desc,
-    where: {
-      reserveUSD_gte: $minReserveUsd,
-      reserveUSD_lte: $maxReserveUsd,
-      volumeUSD_gte: $minVolumeUsd,
-      volumeUSD_lte: $maxVolumeUsd
-    }
-  ) {
-    id
-    token0 { id }
-    token1 { id }
-    feeTier
-    totalValueLockedUSD
-    volumeUSD
-    createdAtTimestamp
-  }
-}
-`;
-
-const SUSHISWAP_TOP_POOLS_ALT_QUERY = `
 query topPools(
   $first: Int!,
   $minTvl: BigDecimal!,
@@ -211,6 +183,37 @@ query topPools(
     token1 { id }
     feeTier
     totalValueLockedUSD
+    volumeUSD
+    createdAtTimestamp
+  }
+}
+`;
+
+// Fallback for PancakeSwap V2-style subgraphs, which expose `pairs` (reserveUSD)
+// instead of the V3-style `pools` entity.
+const PANCAKESWAP_TOP_PAIRS_QUERY = `
+query topPairs(
+  $first: Int!,
+  $minReserveUsd: BigDecimal!,
+  $maxReserveUsd: BigDecimal!,
+  $minVolumeUsd: BigDecimal!,
+  $maxVolumeUsd: BigDecimal!
+) {
+  pairs(
+    first: $first,
+    orderBy: reserveUSD,
+    orderDirection: desc,
+    where: {
+      reserveUSD_gte: $minReserveUsd,
+      reserveUSD_lte: $maxReserveUsd,
+      volumeUSD_gte: $minVolumeUsd,
+      volumeUSD_lte: $maxVolumeUsd
+    }
+  ) {
+    id
+    token0 { id }
+    token1 { id }
+    reserveUSD
     volumeUSD
     createdAtTimestamp
   }
@@ -327,8 +330,8 @@ export class SubgraphPoolLoader {
             SUSHISWAP_TOP_POOLS_QUERY,
             {
                 first: topPools,
-                minReserveUsd: MIN_LIQUIDITY_USD,
-                maxReserveUsd: MAX_LIQUIDITY_USD,
+                minTvl: MIN_LIQUIDITY_USD,
+                maxTvl: MAX_LIQUIDITY_USD,
                 minVolumeUsd: MIN_VOLUME_USD,
                 maxVolumeUsd: MAX_VOLUME_USD
             }
@@ -336,23 +339,6 @@ export class SubgraphPoolLoader {
 
         let pools = response?.data?.pools;
         console.log(`[SushiSwap] Primary query returned ${pools?.length || 0} pools`);
-
-        if (!Array.isArray(pools) || pools.length === 0) {
-            console.log(`[SushiSwap] Trying alternative query...`);
-            response = await this.querySubgraph(
-                subgraphUrl,
-                SUSHISWAP_TOP_POOLS_ALT_QUERY,
-                {
-                    first: topPools,
-                    minTvl: MIN_LIQUIDITY_USD,
-                    maxTvl: MAX_LIQUIDITY_USD,
-                    minVolumeUsd: MIN_VOLUME_USD,
-                    maxVolumeUsd: MAX_VOLUME_USD
-                }
-            );
-            pools = response?.data?.pools;
-            console.log(`[SushiSwap] Alternative query returned ${pools?.length || 0} pools`);
-        }
 
         if (!Array.isArray(pools) || pools.length === 0) {
             console.log(`[SushiSwap] Trying pairs query...`);
@@ -405,7 +391,7 @@ export class SubgraphPoolLoader {
                 volumeUSD: Number(pool.volumeUSD ?? 0),
                 totalValueLockedUSD: Number(pool.totalValueLockedUSD ?? 0),
                 createdAtTimestamp: Number(pool.createdAtTimestamp ?? 0),
-                factory: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4" // SushiSwap factory on Base
+                factory: "0x71524B4f93c58fcbF659783284E38825f0622859" // SushiSwap V2 factory on Base
             });
         }
     }
@@ -483,21 +469,21 @@ export class SubgraphPoolLoader {
         console.log("Loading pools for triangle discovery...");
         
         // Load more pools for triangle discovery
-        console.log(`Loading Uniswap pools from ${uniswapSubgraphUrl}`);
+        console.log(`Loading Uniswap pools from ${this.redactUrl(uniswapSubgraphUrl)}`);
         await this.loadUniswap(uniswapSubgraphUrl, TRIANGLE_POOL_LIMIT);
-        
-        console.log(`Loading SushiSwap pools from ${sushiSwapSubgraphUrl}`);
+
+        console.log(`Loading SushiSwap pools from ${this.redactUrl(sushiSwapSubgraphUrl)}`);
         await this.loadSushiSwap(sushiSwapSubgraphUrl, TRIANGLE_POOL_LIMIT);
-        
+
         // Load PancakeSwap if URL provided
         if (pancakeswapSubgraphUrl) {
-            console.log(`Loading PancakeSwap pools from ${pancakeswapSubgraphUrl}`);
+            console.log(`Loading PancakeSwap pools from ${this.redactUrl(pancakeswapSubgraphUrl)}`);
             await this.loadPancakeSwap(pancakeswapSubgraphUrl, TRIANGLE_POOL_LIMIT);
         }
-        
+
         // Load Aerodrome if URL provided
         if (aerodromeSubgraphUrl) {
-            console.log(`Loading Aerodrome pools from ${aerodromeSubgraphUrl}`);
+            console.log(`Loading Aerodrome pools from ${this.redactUrl(aerodromeSubgraphUrl)}`);
             await this.loadAerodrome(aerodromeSubgraphUrl, TRIANGLE_POOL_LIMIT);
         }
         
@@ -719,7 +705,7 @@ export class SubgraphPoolLoader {
                 volumeUSD: Number(pool.volumeUSD ?? 0),
                 totalValueLockedUSD: Number(pool.totalValueLockedUSD ?? 0),
                 createdAtTimestamp: Number(pool.createdAtTimestamp ?? 0),
-                factory: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4" // SushiSwap factory on Base
+                factory: "0x71524B4f93c58fcbF659783284E38825f0622859" // SushiSwap V2 factory on Base
             });
         }
     }
@@ -778,45 +764,6 @@ export class SubgraphPoolLoader {
     }
 
     /**
-     * Filter triangles to ensure they have liquidity on both DEXes
-     */
-    private filterLiquidTriangles(triangles: string[][], tokenGraph: TokenGraph): string[][] {
-        const { dexEdges } = tokenGraph;
-        const liquidTriangles: string[][] = [];
-
-        for (const triangle of triangles) {
-            const [tokenA, tokenB, tokenC] = triangle;
-            
-            // Check if triangle has liquidity on SushiSwap OR Uniswap (less strict)
-            const hasSushiSwap = this.hasTriangleLiquidity(triangle, dexEdges.get("SUSHISWAP"));
-            const hasUniswap = this.hasTriangleLiquidity(triangle, dexEdges.get("UNISWAP"));
-            
-            // Accept if it has liquidity on at least one DEX
-            if (hasSushiSwap || hasUniswap) {
-                liquidTriangles.push(triangle);
-            }
-        }
-
-        return liquidTriangles;
-    }
-
-    /**
-     * Check if triangle has liquidity on a specific DEX
-     */
-    private hasTriangleLiquidity(triangle: string[], dexEdges?: Map<string, Set<string>>): boolean {
-        if (!dexEdges) return false;
-        
-        const [tokenA, tokenB, tokenC] = triangle;
-        
-        // Check if all three edges exist on this DEX
-        const ab = dexEdges.get(tokenA)?.has(tokenB) || dexEdges.get(tokenB)?.has(tokenA);
-        const bc = dexEdges.get(tokenB)?.has(tokenC) || dexEdges.get(tokenC)?.has(tokenB);
-        const ca = dexEdges.get(tokenC)?.has(tokenA) || dexEdges.get(tokenA)?.has(tokenC);
-        
-        return Boolean(ab && bc && ca);
-    }
-
-    /**
      * Generate unique identifier for triangle based on topology and pool addresses
      * Ensures triangles with same pools but different order are not counted as duplicates
      */
@@ -845,10 +792,12 @@ export class SubgraphPoolLoader {
         );
         
         if (pools.length === 0) return null;
-        
-        // Return pool with highest liquidity
-        return pools.reduce((best, current) => 
-            (current.liquidity || 0) > (best.liquidity || 0) ? current : best
+
+        // Return pool with highest USD liquidity (PoolInfo.liquidity is a raw
+        // token-unit string, not USD, and is not set by subgraph loaders).
+        const liquidityOf = (p: PoolInfo): number => p.reserveUSD ?? p.totalValueLockedUSD ?? 0;
+        return pools.reduce((best, current) =>
+            liquidityOf(current) > liquidityOf(best) ? current : best
         );
     }
     
@@ -860,7 +809,7 @@ export class SubgraphPoolLoader {
             console.log(`[PancakeSwap] Loading pools from ${subgraphUrl}`);
         }
         
-        const result = await this.querySubgraph(
+        let result = await this.querySubgraph(
             subgraphUrl,
             PANCAKESWAP_TOP_POOLS_QUERY,
             {
@@ -872,8 +821,27 @@ export class SubgraphPoolLoader {
             }
         );
 
-        const pools = result?.data?.pools;
+        let pools = result?.data?.pools;
         console.log(`[PancakeSwap] Raw response pools: ${pools?.length ?? 0}`);
+
+        // The configured endpoint may be a V2-style subgraph without a `pools`
+        // entity ("Type `Query` has no field `pools`"); fall back to `pairs`.
+        if (!Array.isArray(pools)) {
+            console.log(`[PancakeSwap] Trying pairs query...`);
+            result = await this.querySubgraph(
+                subgraphUrl,
+                PANCAKESWAP_TOP_PAIRS_QUERY,
+                {
+                    first: topPools,
+                    minReserveUsd: MIN_LIQUIDITY_USD,
+                    maxReserveUsd: MAX_LIQUIDITY_USD,
+                    minVolumeUsd: MIN_VOLUME_USD,
+                    maxVolumeUsd: MAX_VOLUME_USD
+                }
+            );
+            pools = result?.data?.pairs;
+            console.log(`[PancakeSwap] Pairs query returned ${pools?.length ?? 0} pools`);
+        }
 
         if (!Array.isArray(pools)) {
             return;
@@ -894,7 +862,7 @@ export class SubgraphPoolLoader {
                 console.log(
                     `[PancakeSwap] RAW POOL: ${pool.id} | ` +
                     `${pool.token0?.id} ↔ ${pool.token1?.id} | ` +
-                    `TVL=${pool.totalValueLockedUSD} | ` +
+                    `TVL=${pool.totalValueLockedUSD ?? pool.reserveUSD} | ` +
                     `volume=${pool.volumeUSD} | ` +
                     `fee=${pool.feeTier}`
                 );
@@ -910,10 +878,13 @@ export class SubgraphPoolLoader {
                 continue;
             }
 
-            const fee = Number(feeTier ?? 3000);
+            // V2 pairs carry no feeTier; PancakeSwap V2 charges 0.25% (2500).
+            const fee = Number(feeTier ?? 2500);
             if (Number.isNaN(fee) || fee <= 0) {
                 continue;
             }
+
+            const liquidityUSD = Number(pool.totalValueLockedUSD ?? pool.reserveUSD ?? 0);
 
             this.cache.add({
                 dex: "PANCAKESWAP",
@@ -921,8 +892,8 @@ export class SubgraphPoolLoader {
                 token0,
                 token1,
                 fee,
-                reserveUSD: Number(pool.totalValueLockedUSD ?? 0),
-                totalValueLockedUSD: Number(pool.totalValueLockedUSD ?? 0),
+                reserveUSD: liquidityUSD,
+                totalValueLockedUSD: liquidityUSD,
                 volumeUSD: Number(pool.volumeUSD ?? 0),
                 createdAtTimestamp: Number(pool.createdAtTimestamp ?? 0)
             });
@@ -1036,14 +1007,26 @@ export class SubgraphPoolLoader {
             return false;
         }
 
-        if (createdAtTimestamp > 0) {
-            const ageSeconds = Math.floor(Date.now() / 1000) - createdAtTimestamp;
-            if (ageSeconds < MIN_AGE_SECONDS) {
-                return false;
-            }
+        // Fail closed: a missing/invalid timestamp is treated as a brand-new
+        // pool rather than allowing it to bypass the minimum-age filter.
+        const ageSeconds = createdAtTimestamp > 0
+            ? Math.floor(Date.now() / 1000) - createdAtTimestamp
+            : 0;
+        if (ageSeconds < MIN_AGE_SECONDS) {
+            return false;
         }
 
         return true;
+    }
+
+    // Subgraph URLs can embed the Graph API key in the path (gateway URLs) or
+    // query string, so only ever log the host.
+    private redactUrl(url: string): string {
+        try {
+            return new URL(url).host;
+        } catch {
+            return "(invalid url)";
+        }
     }
 
     private async querySubgraph(
@@ -1068,7 +1051,7 @@ export class SubgraphPoolLoader {
 
             if (!response.ok) {
                 const body = await response.text().catch(() => "");
-                console.error(`[Subgraph] HTTP ${response.status} from ${url.slice(0, 60)}...: ${body.slice(0, 200)}`);
+                console.error(`[Subgraph] HTTP ${response.status} from ${this.redactUrl(url)}: ${body.slice(0, 200)}`);
                 return null;
             }
 
@@ -1125,7 +1108,8 @@ export class SubgraphPoolLoader {
             const dexNameMap: { [key: string]: string } = {
                 'UNISWAP': 'UniswapV3',
                 'SUSHISWAP': 'SushiSwap',
-                'PANCAKESWAP': 'PancakeSwap'
+                'PANCAKESWAP': 'PancakeSwap',
+                'AERODROME': 'Aerodrome'
             };
             const normalizedDexName = dexNameMap[normalizedDex] || dex;
             
@@ -1172,7 +1156,8 @@ export class SubgraphPoolLoader {
                 const dexNameMap: { [key: string]: string } = {
                     'UNISWAP': 'UniswapV3',
                     'SUSHISWAP': 'SushiSwap',
-                    'PANCAKESWAP': 'PancakeSwap'
+                    'PANCAKESWAP': 'PancakeSwap',
+                    'AERODROME': 'Aerodrome'
                 };
                 const normalizedDexName = dexNameMap[normalizedDex] || dex;
                 console.log(`    ${normalizedDexName}: ${count} pools`);
@@ -1299,10 +1284,6 @@ export class SubgraphPoolLoader {
                 const score = totalLiquidity + totalVolume * 10; // Weight liquidity more
                 qualityBridgeTokens.push({ token: bridgeToken, score });
             }
-            if (validPools >= 2 && totalLiquidity >= MIN_LIQUIDITY_USD * 2) {
-                const score = totalLiquidity + totalVolume * 10; // Weight liquidity more
-                qualityBridgeTokens.push({ token: bridgeToken, score });
-            }
         }
         
         // Sort by quality score (descending)
@@ -1325,26 +1306,6 @@ export class SubgraphPoolLoader {
         return triangles;
     }
     
-    /**
-     * Get available DEX providers for a token pair
-     */
-    private getAvailableProviders(
-        tokenA: string,
-        tokenB: string,
-        dexEdges: Map<string, Map<string, Set<string>>>
-    ): string[] {
-        const providers: string[] = [];
-        
-        for (const [dexName, tokenEdges] of dexEdges.entries()) {
-            const tokenAEdges = tokenEdges.get(tokenA) || new Set();
-            if (tokenAEdges.has(tokenB)) {
-                providers.push(dexName);
-            }
-        }
-        
-        return providers;
-    }
-
     /**
      * Generate triangles using anchor tokens (USDC and WETH)
      * Uses DEX-specific edges to ensure each leg has a valid pool
@@ -1493,9 +1454,7 @@ export class SubgraphPoolLoader {
         // Find tokens that can form triangles across DEXes
         // Pattern: USDC → Token → WETH → USDC
         // Each leg can use different DEX
-        
-        const potentialTriangles: Array<{tokens: string[], legs: string[]}> = [];
-        
+
         // Get all tokens connected to USDC on any DEX
         const usdcConnectedOnUniswap = uniswapEdges.get(usdcLower) || new Set();
         const usdcConnectedOnAerodrome = aerodromeEdges.get(usdcLower) || new Set();
