@@ -1052,20 +1052,33 @@ export class SubgraphPoolLoader {
         variables: Record<string, unknown>
     ): Promise<any> {
         try {
+            const graphApiKey = process.env.GRAPH_API_KEY;
+            const headers: Record<string, string> = {
+                "Content-Type": "application/json"
+            };
+            if (graphApiKey) {
+                headers["Authorization"] = `Bearer ${graphApiKey}`;
+            }
+
             const response = await fetch(url, {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
+                headers,
                 body: JSON.stringify({ query, variables })
             });
 
             if (!response.ok) {
-                throw new Error(`GraphQL request failed ${response.status}: ${response.statusText}`);
+                const body = await response.text().catch(() => "");
+                console.error(`[Subgraph] HTTP ${response.status} from ${url.slice(0, 60)}...: ${body.slice(0, 200)}`);
+                return null;
             }
 
-            return await response.json();
+            const json = await response.json();
+            if (json.errors) {
+                console.error(`[Subgraph] GraphQL errors:`, JSON.stringify(json.errors).slice(0, 300));
+            }
+            return json;
         } catch (error) {
+            console.error(`[Subgraph] Request failed:`, error instanceof Error ? error.message : error);
             return null;
         }
     }
