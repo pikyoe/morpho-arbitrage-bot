@@ -33,14 +33,20 @@ async function main() {
   console.log("Router:", router);
   console.log("Engine:", engine);
 
-  // PancakeSwap V3 on Base exposes the Uniswap V3 exactInputSingle ABI.
-  // Reuse the audited UniswapV3AdapterV2 implementation; no duplicate Solidity adapter.
-  const Factory = await ethers.getContractFactory("UniswapV3AdapterV2");
+  // PancakeSwap V3's SwapRouter keeps `deadline` inside ExactInputSingleParams
+  // (selector 0x414bf389) and does NOT implement the SwapRouter02-style
+  // exactInputSingle without deadline used by UniswapV3AdapterV2 — it needs
+  // the dedicated PancakeSwapV3AdapterV2 implementation.
+  const Factory = await ethers.getContractFactory("PancakeSwapV3AdapterV2");
   const adapter = await Factory.deploy(owner, router, engine);
   await adapter.waitForDeployment();
 
-  console.log("PancakeSwap adapter implementation: UniswapV3AdapterV2");
+  console.log("PancakeSwap adapter implementation: PancakeSwapV3AdapterV2");
   console.log("PancakeSwapAdapterV2:", await adapter.getAddress());
+  console.log("Next steps:");
+  console.log("  1. Set PANCAKESWAP_ADAPTER_V2_ADDRESS to the address above");
+  console.log("  2. Approve it on the engine: setApprovedAdapter(<address>, true)");
+  console.log("  3. Optionally unapprove the old adapter (setApprovedAdapter(old, false))");
 }
 
 main().catch((error) => {
