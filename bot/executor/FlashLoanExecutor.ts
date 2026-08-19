@@ -22,6 +22,40 @@ const ENGINE_EVENTS = new ethers.Interface([
     "event ArbitrageFinished(uint256 profit)"
 ]);
 
+// Mirrors contracts/v2/libraries/Errors.sol so reverts surface as
+// "DeadlineExpired" etc. instead of "execution reverted (unknown custom error)".
+const ENGINE_ERRORS = new ethers.Interface([
+    "error Unauthorized()",
+    "error InvalidAddress()",
+    "error InvalidAmount()",
+    "error InvalidRoute()",
+    "error InvalidAdapter()",
+    "error RepaymentFailed()",
+    "error InsufficientProfit()",
+    "error ZeroOutput()",
+    "error InvalidSlippage()",
+    "error RescueFailed()",
+    "error DeadlineExpired()",
+    "error InvalidToken()",
+    "error InsufficientBalance()",
+    "error InProgress()",
+    "error InvalidState()"
+]);
+
+function decodeEngineError(e: any): string | null {
+    const candidates = [e?.data, e?.error?.data, e?.info?.error?.data];
+    for (const data of candidates) {
+        if (typeof data !== "string" || !data.startsWith("0x") || data.length < 10) continue;
+        try {
+            const parsed = ENGINE_ERRORS.parseError(data);
+            if (parsed) return parsed.name;
+        } catch {
+            // Not an engine custom error.
+        }
+    }
+    return null;
+}
+
 /**
  * SwapStep as expected by the deployed ArbitrageEngineV2 route struct:
  * (address adapter, address tokenIn, address tokenOut, uint24 fee,
@@ -66,15 +100,20 @@ function normalizeRoute(opp: any): Route {
         const inputIsProfitToken =
             profitToken.toLowerCase() === String(opp?.steps?.[0]?.from || opp?.steps?.[0]?.tokenIn || "").toLowerCase();
 
+        if (opp.steps[0]?.amountIn === undefined && opp.steps[0]?.amount === undefined) {
+            throw new Error("FlashLoanExecutor: first legacy step missing amountIn/amount");
+        }
+
         const swaps: SwapStep[] = opp.steps.map((s: any) => ({
             adapter: s.adapter || s.dex, // legacy: `dex` is the adapter name; resolved later
             tokenIn: s.tokenIn || s.from,
             tokenOut: s.tokenOut || s.to,
             fee: Number(s.fee ?? 0),
-            amountIn: BigInt(s.amountIn ?? s.amount),
+            // 0 = engine fills in the previous leg's output; avoids BigInt(undefined).
+            amountIn: BigInt(s.amountIn ?? s.amount ?? 0),
             minAmountOut: BigInt(s.minAmountOut ?? s.amountOut ?? 0),
             data: s.data || "0x",
-            deadline: Number(s.deadline ?? (Math.floor(Date.now() / 1000) + 60))
+            deadline: Number(s.deadline ?? (Math.floor(Date.now() / 1000) + 300))
         }));
 
         return {
@@ -291,7 +330,9 @@ export class FlashLoanExecutor {
                     console.warn("Gas estimation failed, using configured fallback limit:", estimateError);
                     gasLimit = 650000n;
                 } else {
-                    throw new Error(`Gas estimation failed; refusing execution: ${estimateError instanceof Error ? estimateError.message : String(estimateError)}`);
+                    const decoded = decodeEngineError(estimateError);
+                    const reason = estimateError instanceof Error ? estimateError.message : String(estimateError);
+                    throw new Error(`Gas estimation failed; refusing execution: ${decoded ? `revert ${decoded}() — ` : ""}${reason}`);
                 }
             }
 
@@ -323,17 +364,19 @@ export class FlashLoanExecutor {
 
             return receipt;
         } catch (error: any) {
-            console.error("Transaction execution failed:", error.message);
+            const decoded = decodeEngineError(error);
+            const message = error?.message || String(error);
+            console.error("Transaction execution failed:", decoded ? `${decoded}(): ${message}` : message);
 
-            // Provide more specific error information
-            if (error.message.includes("insufficient funds")) {
+            if (decoded) {
+                throw new Error(`Flash loan reverted: ${decoded}()`);
+            }
+
+            if (message.includes("insufficient funds")) {
                 throw new Error("Insufficient funds for gas + value");
             }
-            if (error.message.includes("nonce")) {
+            if (message.includes("nonce")) {
                 throw new Error("Nonce error - transaction with same nonce already pending");
-            }
-            if (error.message.includes("gas")) {
-                throw new Error("Gas related error - possibly gas limit too low or gas price too high");
             }
 
             throw error;
