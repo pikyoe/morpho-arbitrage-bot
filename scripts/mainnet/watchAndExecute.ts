@@ -281,15 +281,15 @@ async function usdToTokenAmount(usd: number, token: string): Promise<bigint> {
     const decimals = await getDecimals(token);
     const lower = token.toLowerCase();
 
-    // Stablecoins / near-$1 tokens
+    // Stablecoins / near-$1 tokens. sUSDS deliberately excluded: it is a
+    // yield-bearing Sky share token priced > $1, so it is quoted on-chain.
     const STABLE_LIKE = new Set([
         TOKENS.USDC.toLowerCase(),
         TOKENS.USDT.toLowerCase(),
         TOKENS.DAI.toLowerCase(),
         TOKENS.USDe.toLowerCase(),
         TOKENS.RLUSD.toLowerCase(),
-        TOKENS.EURC.toLowerCase(),
-        TOKENS.sUSDS.toLowerCase()
+        TOKENS.EURC.toLowerCase()
     ]);
     if (STABLE_LIKE.has(lower)) {
         return parseUnits(usd.toFixed(6), decimals);
@@ -318,9 +318,10 @@ async function quoteOnRaw(tokenIn: string, tokenOut: string, amountIn: bigint): 
 }
 
 async function tokenUsdPrice(token: string): Promise<number> {
+    // sUSDS excluded: yield-bearing share token (> $1), must be priced via quote.
     const stable = new Set([
         TOKENS.USDC, TOKENS.USDT, TOKENS.DAI, TOKENS.USDe,
-        TOKENS.RLUSD, TOKENS.EURC, TOKENS.sUSDS
+        TOKENS.RLUSD, TOKENS.EURC
     ].map(t => t.toLowerCase()));
     const lower = token.toLowerCase();
     if (stable.has(lower)) return 1;
