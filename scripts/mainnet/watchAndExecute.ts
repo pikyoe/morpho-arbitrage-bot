@@ -21,7 +21,7 @@ import { DexQuoteProvider } from "../../bot/scanner/quote/DexQuoteProvider.js";
 import { QuoteRequest, QuoteResult } from "../../bot/scanner/quote/index.js";
 import { OneInchAggregator } from "../../bot/scanner/aggregator/OneInchAggregator.js";
 import { AdapterRegistry } from "../../bot/registry/AdapterRegistry.js";
-import { FlashLoanExecutor } from "../../bot/executor/FlashLoanExecutor.js";
+import { FlashLoanExecutor, decodeEngineError } from "../../bot/executor/FlashLoanExecutor.js";
 import { TOKEN_DECIMALS, TOKENS, tokenSymbol } from "../../bot/scanner/TokenList.js";
 import { TIER_1_TOKENS, TIER_2_TOKENS } from "../../bot/scanner/TokenUniverse.js";
 import { toUniquePairs, batchPairs, filterPairs } from "../../bot/scanner/UniversalPairFilter.js";
@@ -80,8 +80,11 @@ const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION === "true"; // defau
 // blocked from re-executing for this long, so a persistent-but-unexecutable
 // spread cannot burn gas on repeated reverts.
 const EXECUTION_COOLDOWN_MS = Math.max(0, Number(process.env.EXECUTION_COOLDOWN_MS || 60000));
-// Slippage tolerance: default 0.1%, clamped to [0.1%, 1.5%] — never defaults to the max.
-const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.1), 0.1), 1.5);
+// Slippage tolerance: default 0.5% (clamp [0.05%, 2%]). The 1inch leg executes
+// with freshly fetched calldata whose exact input depends on the quoted amount;
+// using only 0.1% risks ZeroOutput reverts when the quote decays between scan
+// and execution. Wider default pushes reverts into pre-flight simulation instead.
+const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.5), 0.05), 2);
 // minProfit floor: keep this % of the quoted profit on-chain (clamped 10–90%).
 // Demanding the full quoted profit reverts InsufficientProfit on any adverse
 // price move between quote and execution; a fractional floor tolerates drift
@@ -125,6 +128,27 @@ const SwapStepTuple = "(address adapter,address tokenIn,address tokenOut,uint24 
 const RouteTuple = `(${SwapStepTuple}[] swaps,address profitToken,uint256 minProfit)`;
 const EXECUTE_ARBITRAGE_ABI = `function executeArbitrage(address token,uint256 amount,${RouteTuple} route)`;
 const VALIDATE_ROUTE_ABI = `function validateRoute(${RouteTuple} route,address token) view returns (bool)`;
+
+// Pre-flight simulation: if PREFLIGHT_SIMULATION is not "false", run an
+// eth_call (static simulation via ethers.call awaiting the revert reason)
+// and skip when it reverts instead of spending gas on a known-bad route.
+async function preflightSimulation(
+    engineContract: Contract,
+    token: string,
+    amount: bigint,
+    route: any
+): Promise<string | null> {
+    if (process.env.PREFLIGHT_SIMULATION === "false") return null;
+    try {
+        await engineContract.executeArbitrage.staticCall(token, amount, route);
+        return null;
+    } catch (e: any) {
+        const decoded = decodeEngineError(e);
+        return decoded
+            ? `revert ${decoded}() — ${e?.message || String(e)}`
+            : (e?.message || String(e));
+    }
+}
 
 // ------------------------------------------------------------------
 // Providers
@@ -1108,6 +1132,15 @@ async function main() {
                 continue;
             }
 
+            // Preflight simulation: skip before spending real gas if the route reverts.
+            const preflightReason = await preflightSimulation(engineContract!, tokenA, opp.inputAmount, opp.route);
+            if (preflightReason !== null) {
+                lastExecutionFailAt.set(cooldownKey, Date.now());
+                console.log(`  ⚠️ Preflight simulation failed: ${preflightReason} — skipping execution`);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                continue;
+            }
+
             console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
             let executed = false;
             try {
@@ -1306,6 +1339,15 @@ async function main() {
         const netAfterGas = await netProfitAfterGasUSD(opp, WATCH_PAIR_A);
         if (netAfterGas < MIN_NET_PROFIT_USD) {
             console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            continue;
+        }
+
+        // Preflight simulation: skip before spending gas on a route that reverts.
+        const preflightReason = await preflightSimulation(engineContract!, WATCH_PAIR_A, opp.inputAmount, opp.route);
+        if (preflightReason !== null) {
+            lastExecutionFailAt.set(cooldownKey, Date.now());
+            console.log(`  ⚠️ Preflight simulation failed: ${preflightReason} — skipping execution`);
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
             continue;
         }
