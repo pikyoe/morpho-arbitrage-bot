@@ -220,24 +220,20 @@ query topPairs(
 }
 `;
 
-const AERODROME_TOP_POOLS_QUERY = `
-query topPools(
+// BigDecimal orderBy (volumeUSD/totalValueLockedUSD) consistently times out
+// on gateway indexers for this subgraph ("bad indexers: Timeout"), so we
+// paginate by id (indexed, fast) and filter/sort client-side instead.
+const AERODROME_POOLS_PAGE_QUERY = `
+query poolsPage(
   $first: Int!,
-  $minTvl: BigDecimal!,
-  $maxTvl: BigDecimal!,
-  $minVolumeUsd: BigDecimal!,
-  $maxVolumeUsd: BigDecimal!
+  $afterId: String!,
+  $beforeId: String!
 ) {
   pools(
     first: $first,
-    orderBy: volumeUSD,
-    orderDirection: desc,
-    where: {
-      totalValueLockedUSD_gte: $minTvl,
-      totalValueLockedUSD_lte: $maxTvl,
-      volumeUSD_gte: $minVolumeUsd,
-      volumeUSD_lte: $maxVolumeUsd
-    }
+    orderBy: id,
+    orderDirection: asc,
+    where: { id_gt: $afterId, id_lt: $beforeId }
   ) {
     id
     token0 { id }
@@ -249,6 +245,13 @@ query topPools(
   }
 }
 `;
+const AERODROME_PAGE_SIZE = 500;
+// Shard by id prefix so each query stays small enough for the gateway
+// indexers (unbounded scans with 1000+ rows time out on this subgraph).
+const AERODROME_SHARD_BOUNDS: Array<[string, string]> = [
+    ["0x0", "0x2"], ["0x2", "0x4"], ["0x4", "0x6"], ["0x6", "0x8"],
+    ["0x8", "0xa"], ["0xa", "0xc"], ["0xc", "0xe"], ["0xe", "0xg"]
+];
 
 export class SubgraphPoolLoader {
     private readonly whitelistSet: Set<string>;
@@ -404,35 +407,47 @@ export class SubgraphPoolLoader {
             console.log(`[Aerodrome] Loading pools from ${subgraphUrl}`);
         }
         
-        const response = await this.querySubgraph(
-            subgraphUrl,
-            AERODROME_TOP_POOLS_QUERY,
-            {
-                first: topPools,
-                minTvl: MIN_LIQUIDITY_USD,
-                maxTvl: MAX_LIQUIDITY_USD,
-                minVolumeUsd: MIN_VOLUME_USD,
-                maxVolumeUsd: MAX_VOLUME_USD
-            }
+        const shardResults = await Promise.all(
+            AERODROME_SHARD_BOUNDS.map(async ([lowerId, upperId]) => {
+                const shardPools: any[] = [];
+                let afterId = lowerId;
+                while (true) {
+                    const response = await this.querySubgraph(
+                        subgraphUrl,
+                        AERODROME_POOLS_PAGE_QUERY,
+                        { first: AERODROME_PAGE_SIZE, afterId, beforeId: upperId }
+                    );
+                    const pools = response?.data?.pools;
+                    if (!Array.isArray(pools) || pools.length === 0) {
+                        break;
+                    }
+                    shardPools.push(...pools);
+                    afterId = pools[pools.length - 1].id;
+                    if (pools.length < AERODROME_PAGE_SIZE) {
+                        break;
+                    }
+                }
+                return shardPools;
+            })
         );
 
-        const pools = response?.data?.pools;
-        console.log(`[Aerodrome] Query returned ${pools?.length || 0} pools`);
-
-        if (!Array.isArray(pools)) {
-            return;
+        const eligible: any[] = [];
+        for (const pool of shardResults.flat()) {
+            if (this.isEligiblePool(pool)) {
+                eligible.push(pool);
+            }
         }
 
-        for (const pool of pools) {
+        eligible.sort((a, b) => Number(b?.volumeUSD ?? 0) - Number(a?.volumeUSD ?? 0));
+        const topEligible = eligible.slice(0, topPools);
+        console.log(`[Aerodrome] ${eligible.length} eligible pools after scan, keeping top ${topEligible.length}`);
+
+        for (const pool of topEligible) {
             const token0 = pool?.token0?.id;
             const token1 = pool?.token1?.id;
             const feeTier = pool?.feeTier;
 
             if (!token0 || !token1 || !pool?.id) {
-                continue;
-            }
-
-            if (!this.isEligiblePool(pool)) {
                 continue;
             }
 
@@ -1034,12 +1049,21 @@ export class SubgraphPoolLoader {
         }
     }
 
+    private resolveSubgraphUrl(url: string): string {
+        const graphApiKey = process.env.GRAPH_API_KEY;
+        if (graphApiKey && url.includes("${GRAPH_API_KEY}")) {
+            return url.replace(/\$\{GRAPH_API_KEY\}/g, graphApiKey);
+        }
+        return url;
+    }
+
     private async querySubgraph(
         url: string,
         query: string,
         variables: Record<string, unknown>
     ): Promise<any> {
         try {
+            url = this.resolveSubgraphUrl(url);
             const graphApiKey = process.env.GRAPH_API_KEY;
             const headers: Record<string, string> = {
                 "Content-Type": "application/json"
