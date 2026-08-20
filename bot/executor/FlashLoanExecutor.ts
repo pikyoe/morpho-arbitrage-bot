@@ -42,7 +42,7 @@ const ENGINE_ERRORS = new ethers.Interface([
     "error InvalidState()"
 ]);
 
-function decodeEngineError(e: any): string | null {
+export function decodeEngineError(e: any): string | null {
     const candidates = [e?.data, e?.error?.data, e?.info?.error?.data];
     for (const data of candidates) {
         if (typeof data !== "string" || !data.startsWith("0x") || data.length < 10) continue;
