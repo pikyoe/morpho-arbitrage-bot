@@ -188,6 +188,23 @@ async function main() {
     }
   }
 
+  for (const [name, address] of [
+    ["SushiSwap", sushiSwapAdapterAddress],
+    ["PancakeSwap", pancakeSwapAdapterAddress]
+  ] as const) {
+    if (!address) continue;
+    try {
+      const approved = await engine.approvedAdapter(address);
+      console.log(`${name}:`, approved);
+
+      if (!approved) {
+        console.warn(`⚠️ ${name} adapter not approved on the engine`);
+      }
+    } catch (error) {
+      console.warn(`⚠️ Could not check ${name} adapter approval:`, error);
+    }
+  }
+
   console.log("====================");
   console.log("OWNERS");
   console.log("====================");

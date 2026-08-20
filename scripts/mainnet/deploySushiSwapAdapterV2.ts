@@ -33,14 +33,20 @@ async function main() {
   console.log("Router:", router);
   console.log("Engine:", engine);
 
-  // SushiSwap V3 on Base exposes the Uniswap V3 exactInputSingle ABI.
-  // Reuse the audited UniswapV3AdapterV2 implementation; no duplicate Solidity adapter.
-  const Factory = await ethers.getContractFactory("UniswapV3AdapterV2");
+  // SushiSwap V3 on Base (0xFB7eF66a...) is a PancakeSwap V3 SwapRouter
+  // deployment: exactInputSingle keeps `deadline` inside the params struct
+  // (0x414bf389) and does NOT implement the SwapRouter02-style signature used
+  // by UniswapV3AdapterV2. Deploy the PancakeSwap-style adapter.
+  const Factory = await ethers.getContractFactory("PancakeSwapV3AdapterV2");
   const adapter = await Factory.deploy(owner, router, engine);
   await adapter.waitForDeployment();
 
-  console.log("SushiSwap adapter implementation: UniswapV3AdapterV2");
+  console.log("SushiSwap adapter implementation: PancakeSwapV3AdapterV2");
   console.log("SushiSwapAdapterV2:", await adapter.getAddress());
+  console.log("Next steps:");
+  console.log("  1. Set SUSHISWAP_ADAPTER_V2_ADDRESS to the address above");
+  console.log("  2. Approve it on the engine: setApprovedAdapter(<address>, true)");
+  console.log("  3. Optionally unapprove the old adapter (setApprovedAdapter(old, false))");
 }
 
 main().catch((error) => {
