@@ -911,10 +911,12 @@ export class SubgraphPoolLoader {
         // liquidity/age are filtered downstream (RPC quote reverts on thin pools).
         if (!Array.isArray(pools)) {
             console.log(`[PancakeSwap] Trying factory poolCreateds query...`);
+            // The Graph gateway caps `first` at 1000; clamp the over-fetch.
+            const recentFirst = Math.min(1000, Math.max(topPools * 20, 200));
             result = await this.querySubgraph(
                 subgraphUrl,
                 PANCAKESWAP_POOL_CREATEDS_QUERY,
-                { first: Math.max(topPools * 20, 200) }
+                { first: recentFirst }
             );
             const createds = result?.data?.poolCreateds;
             if (Array.isArray(createds)) {
