@@ -933,6 +933,23 @@ async function main() {
             }
         }
 
+        // The PancakeSwap Base subgraph is a factory (PoolCreated events only);
+        // its recent-events fallback can miss older watched pairs. Query each
+        // list-mode pair explicitly so coverage does not depend on the window.
+        if (WATCH_MODE === "list" && process.env.PANCAKESWAP_SUBGRAPH_URL) {
+            for (const pair of resolveScanPairs()) {
+                try {
+                    await subgraphLoader.loadPancakeSwapPair(
+                        process.env.PANCAKESWAP_SUBGRAPH_URL,
+                        pair.tokenA,
+                        pair.tokenB
+                    );
+                } catch (e: any) {
+                    if (VERBOSE) console.log(`  PancakeSwap pair load failed (${e?.message || String(e)})`);
+                }
+            }
+        }
+
         // Targeted mode must load the explicitly requested pairs even when
         // they are absent from the subgraph's top-pools result.
         if (WATCH_MODE === "list" && process.env.TARGETED_ALLOW_RPC_POOL_DISCOVERY === "true") {
