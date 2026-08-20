@@ -964,6 +964,11 @@ async function main() {
             for (const pair of targetedPairs) {
                 for (const [dex, factory] of targetedFactories) {
                     if (!factory) continue;
+                    // Skip this factory's RPC sweep if the subgraph already
+                    // cached this pair for this DEX (spread still quotes
+                    // on-chain via dataProvider).
+                    const cached = poolCache.findPair(pair.tokenA, pair.tokenB);
+                    if (cached.some(p => p.dex.toUpperCase() === dex)) continue;
                     try {
                         await targetedLoader.loadPair(factory, dex, pair.tokenA, pair.tokenB);
                     } catch (e: any) {
