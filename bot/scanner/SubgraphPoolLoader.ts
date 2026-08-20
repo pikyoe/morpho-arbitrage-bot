@@ -267,6 +267,30 @@ query poolCreatedsForPair($t0: String!, $t1: String!) {
 }
 `;
 
+// V3 liquidity schema variant of the pair lookup, used when the endpoint
+// exposes `pools` (e.g. the PancakeSwap V3 Base liquidity subgraph).
+const PANCAKESWAP_POOLS_PAIR_QUERY = `
+query poolsForPair($t0: String!, $t1: String!) {
+  pools(
+    first: 50,
+    where: {
+      or: [
+        { token0: $t0, token1: $t1 },
+        { token0: $t1, token1: $t0 }
+      ]
+    }
+  ) {
+    id
+    token0 { id }
+    token1 { id }
+    feeTier
+    totalValueLockedUSD
+    volumeUSD
+    createdAtTimestamp
+  }
+}
+`;
+
 // BigDecimal orderBy (volumeUSD/totalValueLockedUSD) consistently times out
 // on gateway indexers for this subgraph ("bad indexers: Timeout"), so we
 // paginate by id (indexed, fast) and filter/sort client-side instead.
@@ -302,6 +326,7 @@ const AERODROME_SHARD_BOUNDS: Array<[string, string]> = [
 
 export class SubgraphPoolLoader {
     private readonly whitelistSet: Set<string>;
+    private readonly pancakeSchemaByUrl = new Map<string, "pools" | "poolCreateds">();
 
     constructor(
         private readonly cache: PoolCache
@@ -1048,24 +1073,79 @@ export class SubgraphPoolLoader {
     }
 
     /**
-     * Load the exact PancakeSwap pools for one token pair from the factory
-     * subgraph. Use this to guarantee a watched pair is present even when it
-     * falls outside the recent-events window of the broad loadPancakeSwap
-     * fallback. No-op against endpoints that are not the factory schema.
+     * Load the exact PancakeSwap pools for one token pair. Schema-agnostic:
+     * queries the V3 liquidity schema (`pools`) when the endpoint supports it,
+     * falling back to factory `poolCreateds` for the factory subgraph. Used to
+     * guarantee a watched pair is present even when it is outside the
+     * top-pools window of the broad loadPancakeSwap.
      */
     public async loadPancakeSwapPair(
         subgraphUrl: string,
         tokenA: string,
         tokenB: string
     ): Promise<number> {
+        const t0 = tokenA.toLowerCase();
+        const t1 = tokenB.toLowerCase();
+
+        // Detect the schema once per endpoint: probe the V3 liquidity schema
+        // first (`pools`), then the factory schema (`poolCreateds`).
+        let schema = this.pancakeSchemaByUrl.get(subgraphUrl);
+        if (!schema) {
+            const probe = await this.querySubgraph(subgraphUrl, `query { pools(first: 1) { id } }`, {});
+            schema = Array.isArray(probe?.data?.pools) ? "pools" : "poolCreateds";
+            this.pancakeSchemaByUrl.set(subgraphUrl, schema);
+        }
+
+        if (schema === "pools") {
+            const result = await this.querySubgraph(
+                subgraphUrl,
+                PANCAKESWAP_POOLS_PAIR_QUERY,
+                { t0, t1 }
+            );
+            const pools = result?.data?.pools;
+            if (!Array.isArray(pools)) return 0;
+            return this.cachePancakeLiquidityPools(pools);
+        }
+
         const result = await this.querySubgraph(
             subgraphUrl,
             PANCAKESWAP_POOL_CREATEDS_PAIR_QUERY,
-            { t0: tokenA.toLowerCase(), t1: tokenB.toLowerCase() }
+            { t0, t1 }
         );
         const createds = result?.data?.poolCreateds;
         if (!Array.isArray(createds)) return 0;
         return this.cachePancakePoolCreateds(createds);
+    }
+
+    /**
+     * Cache pools from the V3 liquidity schema (`pools`) for a pair lookup.
+     * Returns the number of pools added.
+     */
+    private cachePancakeLiquidityPools(pools: any[]): number {
+        let accepted = 0;
+        for (const pool of pools) {
+            const token0 = pool?.token0?.id;
+            const token1 = pool?.token1?.id;
+            const fee = Number(pool?.feeTier);
+            if (!pool?.id || !token0 || !token1) continue;
+            if (Number.isNaN(fee) || fee <= 0) continue;
+            if (!this.isEligiblePool(pool)) continue;
+
+            const liquidityUSD = Number(pool.totalValueLockedUSD ?? pool.reserveUSD ?? 0);
+            this.cache.add({
+                dex: "PANCAKESWAP",
+                pool: pool.id,
+                token0,
+                token1,
+                fee,
+                reserveUSD: liquidityUSD,
+                totalValueLockedUSD: liquidityUSD,
+                volumeUSD: Number(pool.volumeUSD ?? 0),
+                createdAtTimestamp: Number(pool.createdAtTimestamp ?? 0)
+            });
+            accepted++;
+        }
+        return accepted;
     }
 
     public async loadBridgeTokenPools(
