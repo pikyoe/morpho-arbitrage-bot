@@ -127,11 +127,13 @@ if (!Number.isFinite(MAX_LOAN_USD) || MAX_LOAN_USD <= 0) {
 const SwapStepTuple = "(address adapter,address tokenIn,address tokenOut,uint24 fee,uint256 amountIn,uint256 minAmountOut,bytes data,uint256 deadline)";
 const RouteTuple = `(${SwapStepTuple}[] swaps,address profitToken,uint256 minProfit)`;
 const EXECUTE_ARBITRAGE_ABI = `function executeArbitrage(address token,uint256 amount,${RouteTuple} route)`;
-const VALIDATE_ROUTE_ABI = `function validateRoute(${RouteTuple} route,address token) view returns (bool)`;
 
 // Pre-flight simulation: if PREFLIGHT_SIMULATION is not "false", run an
 // eth_call (static simulation via ethers.call awaiting the revert reason)
 // and skip when it reverts instead of spending gas on a known-bad route.
+// executeArbitrage runs _validateRoute internally, so this single call also
+// covers every check a separate validateRoute eth_call would — one less RPC
+// round-trip between quote and execution.
 async function preflightSimulation(
     engineContract: Contract,
     token: string,
@@ -853,11 +855,8 @@ async function main() {
             );
             engineContract = new Contract(
                 engineAddress,
-                // ABI matching ArbitrageEngineV2: executeArbitrage(token, amount, route) and validateRoute(route, token)
-                [
-                    EXECUTE_ARBITRAGE_ABI,
-                    VALIDATE_ROUTE_ABI
-                ],
+                // ABI matching ArbitrageEngineV2: executeArbitrage(token, amount, route)
+                [EXECUTE_ARBITRAGE_ABI],
                 wallet!
             );
             executor = new FlashLoanExecutor(engineContract, adapterRegistry);
@@ -1112,18 +1111,6 @@ async function main() {
                 await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
                 continue;
             }
-            try {
-                const ok = await engineContract!.validateRoute(opp.route, tokenA);
-                if (!ok) {
-                    console.log("  ⚠️ validateRoute returned false — skipping execution");
-                    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-                    continue;
-                }
-            } catch (e: any) {
-                console.log(`  ⚠️ validateRoute failed (${e?.message || String(e)}) — skipping execution`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-                continue;
-            }
 
             const netAfterGas = await netProfitAfterGasUSD(opp, tokenA);
             if (netAfterGas < MIN_NET_PROFIT_USD) {
@@ -1318,20 +1305,6 @@ async function main() {
             opp = await buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
         } catch (e: any) {
             console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-            continue;
-        }
-
-        // Validate route on-chain before spending gas (non-fatal if it fails)
-        try {
-            const ok = await engineContract!.validateRoute(opp.route, WATCH_PAIR_A);
-            if (!ok) {
-                console.log("  ⚠️ validateRoute returned false — skipping execution");
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-                continue;
-            }
-        } catch (e: any) {
-            console.log(`  ⚠️ validateRoute failed (${e?.message || String(e)}) — skipping execution`);
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
             continue;
         }
