@@ -194,7 +194,8 @@ query topPools(
 `;
 
 // Fallback for PancakeSwap V2-style subgraphs, which expose `pairs` (reserveUSD)
-// instead of the V3-style `pools` entity.
+// instead of the V3-style `pools` entity. The V2 `Pair` entity has no
+// createdAt* field, so the minimum-age filter is skipped for these pools.
 const PANCAKESWAP_TOP_PAIRS_QUERY = `
 query topPairs(
   $first: Int!,
@@ -219,7 +220,6 @@ query topPairs(
     token1 { id }
     reserveUSD
     volumeUSD
-    createdAtTimestamp
   }
 }
 `;
@@ -911,8 +911,10 @@ export class SubgraphPoolLoader {
         // liquidity/age are filtered downstream (RPC quote reverts on thin pools).
         if (!Array.isArray(pools)) {
             console.log(`[PancakeSwap] Trying factory poolCreateds query...`);
-            // The Graph gateway caps `first` at 1000; clamp the over-fetch.
-            const recentFirst = Math.min(1000, Math.max(topPools * 20, 200));
+            // Keep the factory over-fetch close to topPools so a full-liquidity
+            // endpoint (e.g. the V3 liquidity subgraph) never performs the heavy
+            // 1000-row factory scan. The Graph gateway caps `first` at 1000.
+            const recentFirst = Math.min(1000, Math.max(topPools, 100));
             result = await this.querySubgraph(
                 subgraphUrl,
                 PANCAKESWAP_POOL_CREATEDS_QUERY,
