@@ -159,6 +159,10 @@ query topPairs(
 }
 `;
 
+// The official PancakeSwap V3 Base subgraph
+// (id 84ADrft27B8Jo46mdknbJ3PHoJ5wK5YeNBrYTD19WnaH) is a FACTORY subgraph: it
+// indexes PoolCreated events and exposes no `pools`/`pairs` liquidity entity,
+// so the pool/Pairs queries below are kept only for richer V3/V2 endpoints.
 const PANCAKESWAP_TOP_POOLS_QUERY = `
 query topPools(
   $first: Int!,
@@ -216,6 +220,49 @@ query topPairs(
     reserveUSD
     volumeUSD
     createdAtTimestamp
+  }
+}
+`;
+
+// Recent PoolCreated events from the factory subgraph. token0/token1 are
+// plain Bytes here (not Token entities), and `fee` is an Int (not `feeTier`).
+// No TVL/volume exists at this level — those are filtered downstream.
+const PANCAKESWAP_POOL_CREATEDS_QUERY = `
+query poolCreateds($first: Int!) {
+  poolCreateds(
+    first: $first,
+    orderBy: blockNumber,
+    orderDirection: desc
+  ) {
+    pool
+    token0
+    token1
+    fee
+    blockNumber
+    blockTimestamp
+  }
+}
+`;
+
+// Exact pool lookup for one token pair against the factory subgraph (both
+// orderings). Guarantees a watched pair is found even when it is older than
+// the recent-events window used by the broad loadPancakeSwap fallback.
+const PANCAKESWAP_POOL_CREATEDS_PAIR_QUERY = `
+query poolCreatedsForPair($t0: String!, $t1: String!) {
+  poolCreateds(
+    first: 50,
+    where: {
+      or: [
+        { token0: $t0, token1: $t1 },
+        { token0: $t1, token1: $t0 }
+      ]
+    }
+  ) {
+    pool
+    token0
+    token1
+    fee
+    blockTimestamp
   }
 }
 `;
@@ -821,9 +868,9 @@ export class SubgraphPoolLoader {
         topPools: number = DEFAULT_POOL_LIMIT
     ): Promise<void> {
         if (SUBGRAPH_VERBOSE) {
-            console.log(`[PancakeSwap] Loading pools from ${subgraphUrl}`);
+            console.log(`[PancakeSwap] Loading pools from ${this.redactUrl(subgraphUrl)}`);
         }
-        
+
         let result = await this.querySubgraph(
             subgraphUrl,
             PANCAKESWAP_TOP_POOLS_QUERY,
@@ -858,9 +905,28 @@ export class SubgraphPoolLoader {
             console.log(`[PancakeSwap] Pairs query returned ${pools?.length ?? 0} pools`);
         }
 
+        // The official PancakeSwap V3 Base subgraph is a FACTORY subgraph: it
+        // has neither `pools` nor `pairs`, only PoolCreated events. Load recent
+        // events so the quoter knows the real pool addresses and fee tiers;
+        // liquidity/age are filtered downstream (RPC quote reverts on thin pools).
+        if (!Array.isArray(pools)) {
+            console.log(`[PancakeSwap] Trying factory poolCreateds query...`);
+            result = await this.querySubgraph(
+                subgraphUrl,
+                PANCAKESWAP_POOL_CREATEDS_QUERY,
+                { first: Math.max(topPools * 20, 200) }
+            );
+            const createds = result?.data?.poolCreateds;
+            if (Array.isArray(createds)) {
+                const accepted = this.cachePancakePoolCreateds(createds);
+                console.log(`[PancakeSwap] Final accepted pools: ${accepted} (from factory poolCreateds)`);
+                return;
+            }
+        }
+
         if (!Array.isArray(pools)) {
             console.error(
-                `[PancakeSwap] Endpoint has neither \`pools\` nor \`pairs\` — ` +
+                `[PancakeSwap] Endpoint has neither \`pools\` nor \`pairs\` nor \`poolCreateds\` — ` +
                 `PANCAKESWAP_SUBGRAPH_URL is misconfigured (unset it to skip this DEX, ` +
                 `or load via RPC like runBot.ts does). Host: ${this.redactUrl(subgraphUrl)}`
             );
@@ -921,6 +987,81 @@ export class SubgraphPoolLoader {
         }
 
         console.log(`[PancakeSwap] Final accepted pools: ${acceptedPools}`);
+    }
+
+    /**
+     * Cache pools discovered from factory `poolCreateds` events. The factory
+     * subgraph has no liquidity/age data, so only structural validity and the
+     * token whitelist are enforced here; liquidity, age, and sanity are
+     * enforced downstream (on-chain quote + spread/profit checks). Returns the
+     * number of pools added.
+     */
+    private cachePancakePoolCreateds(createds: any[]): number {
+        // Prefer pools touching known/universe tokens so the watcher's fixed
+        // pairs are covered even when the recent-events window is spammed by
+        // brand-new memecoin pools.
+        const universe = new Set(
+            getActiveUniverse().tokens.map((t: string) => t.toLowerCase())
+        );
+        const relevant = createds.filter(pc => {
+            const t0 = (typeof pc?.token0 === "string" ? pc.token0 : pc?.token0?.id)?.toLowerCase();
+            const t1 = (typeof pc?.token1 === "string" ? pc.token1 : pc?.token1?.id)?.toLowerCase();
+            return (t0 && universe.has(t0)) || (t1 && universe.has(t1));
+        });
+        // Relevant (universe-token) pools first, then the rest; cap the rest so
+        // one noisy launch window cannot flood the cache.
+        const others = createds.filter(pc => !relevant.includes(pc));
+        const ordered = [...relevant, ...others.slice(0, 100)];
+
+        let accepted = 0;
+        for (const pc of ordered) {
+            const pool = pc?.pool;
+            const token0 = typeof pc?.token0 === "string" ? pc.token0 : pc?.token0?.id;
+            const token1 = typeof pc?.token1 === "string" ? pc.token1 : pc?.token1?.id;
+            const fee = Number(pc?.fee);
+            if (!pool || !token0 || !token1) continue;
+            if (Number.isNaN(fee) || fee <= 0) continue;
+
+            // Respect the whitelist when one is configured (same bridge-token
+            // rule as isEligiblePool).
+            if (this.whitelistSet.size > 0) {
+                const t0 = token0.toLowerCase();
+                const t1 = token1.toLowerCase();
+                if (!this.whitelistSet.has(t0) && !this.whitelistSet.has(t1)) continue;
+            }
+
+            this.cache.add({
+                dex: "PANCAKESWAP",
+                pool,
+                token0,
+                token1,
+                fee,
+                createdAtTimestamp: Number(pc?.blockTimestamp ?? 0)
+            });
+            accepted++;
+        }
+        return accepted;
+    }
+
+    /**
+     * Load the exact PancakeSwap pools for one token pair from the factory
+     * subgraph. Use this to guarantee a watched pair is present even when it
+     * falls outside the recent-events window of the broad loadPancakeSwap
+     * fallback. No-op against endpoints that are not the factory schema.
+     */
+    public async loadPancakeSwapPair(
+        subgraphUrl: string,
+        tokenA: string,
+        tokenB: string
+    ): Promise<number> {
+        const result = await this.querySubgraph(
+            subgraphUrl,
+            PANCAKESWAP_POOL_CREATEDS_PAIR_QUERY,
+            { t0: tokenA.toLowerCase(), t1: tokenB.toLowerCase() }
+        );
+        const createds = result?.data?.poolCreateds;
+        if (!Array.isArray(createds)) return 0;
+        return this.cachePancakePoolCreateds(createds);
     }
 
     public async loadBridgeTokenPools(
