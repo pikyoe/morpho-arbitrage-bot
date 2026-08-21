@@ -873,7 +873,8 @@ async function main() {
         ? `$${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX} (ladder +$${TEST_AMOUNT_USD_STEP}/loop)`
         : `$${TEST_AMOUNT_USD}`;
     console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: ${testSizeLabel} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms | Slippage: ${SLIPPAGE_PCT}%`);
-    console.log(`Trigger: ${wsProvider ? `WebSocket block events (${process.env.BASE_WS_RPC_URL}) + ${POLL_INTERVAL_MS}ms fallback` : `HTTP polling every ${POLL_INTERVAL_MS}ms (set BASE_WS_RPC_URL for block-driven ticks)`}`);
+    // Never log the WS URL — it embeds the provider API key.
+    console.log(`Trigger: ${wsProvider ? `WebSocket block events + ${POLL_INTERVAL_MS}ms fallback` : `HTTP polling every ${POLL_INTERVAL_MS}ms (set BASE_WS_RPC_URL for block-driven ticks)`}`);
     console.log(`Execution: ${ENABLE_EXECUTION ? "ENABLED" : "DISABLED (watch only)"}`);
     console.log(`Signer: ${wallet ? wallet.address : "n/a (watch-only, no PRIVATE_KEY)"}`);
     console.log();
