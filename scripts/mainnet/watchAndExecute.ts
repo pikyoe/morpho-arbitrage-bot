@@ -194,6 +194,7 @@ async function quoteOneInch(request: QuoteRequest): Promise<QuoteResult | null> 
     }
     try {
         const q = await oneInchAggregator.getQuote(request);
+        if (q && q.amountOut > 0n) (q as any).quotedAtMs = Date.now();
         return q && q.amountOut > 0n ? q : null;
     } catch {
         return null;
@@ -548,6 +549,7 @@ async function scanAllPairs(
                     const [dexBuyQuotes, qInchBuy] = await Promise.all([
                         Promise.all(dexProviders.map(async (dex) => {
                             const qBuy = await quoteOn(dex, pair.tokenA, pair.tokenB, amountIn);
+                            if (qBuy) (qBuy as any).quotedAtMs = Date.now();
                             return qBuy ? { dex: dex.getDexName(), q: qBuy } : null;
                         })),
                         quoteOneInch({ tokenIn: pair.tokenA, tokenOut: pair.tokenB, amountIn })
@@ -571,6 +573,7 @@ async function scanAllPairs(
                     const [dexSellQuotes, qInchSell] = await Promise.all([
                         Promise.all(dexProviders.map(async (dex) => {
                             const qSell = await quoteOn(dex, pair.tokenB, pair.tokenA, buyAmountOut);
+                            if (qSell) (qSell as any).quotedAtMs = Date.now();
                             return qSell ? { dex: dex.getDexName(), q: qSell } : null;
                         })),
                         quoteOneInch({ tokenIn: pair.tokenB, tokenOut: pair.tokenA, amountIn: buyAmountOut })
@@ -641,6 +644,7 @@ async function buildOpportunity(
     profit: bigint,
     adapterRegistry: AdapterRegistry
 ): Promise<any> {
+    const buildStartMs = Date.now();
     // Apply slippage tolerance to each leg's minimum output (capped at 1.5%).
     const slip = (out: bigint) => (out * (1000n - BigInt(Math.round(SLIPPAGE_PCT * 10)))) / 1000n;
     // 300s (matches RouteBuilder): adapters revert when deadline <= block.timestamp,
@@ -656,16 +660,21 @@ async function buildOpportunity(
             if (!oneInchAggregator) {
                 throw new Error("1inch aggregator not configured (INCH_API_KEY/INCH_API_BASE_URL)");
             }
+            const swapDataStartMs = Date.now();
             const swapData = await oneInchAggregator.getSwapData(
                 { tokenIn: q.tokenIn, tokenOut: q.tokenOut, amountIn: amountInRaw },
                 oneInchAdapter,
                 Math.round(SLIPPAGE_PCT * 100), // 1inch slippage in basis points
                 { receiver: oneInchAdapter, deadline }
             );
+            const swapDataMs = Date.now() - swapDataStartMs;
             if (!swapData?.tx?.data) {
                 throw new Error(`1inch swap data unavailable for ${q.tokenIn.slice(0, 6)}→${q.tokenOut.slice(0, 6)}`);
             }
-            console.log(`[1inch-debug] amountInRaw=${amountInRaw}, quoted reverse.amountIn=${q.amountIn}, ratio=${Number(amountInRaw) / Number(q.amountIn)}`);
+            console.log(
+                `[latency] 1inch getSwapData ${q.tokenIn.slice(0, 6)}→${q.tokenOut.slice(0, 6)}: ${swapDataMs}ms | ` +
+                `buildStep offset=${swapDataStartMs - buildStartMs}ms | ratio ${(Number(amountInRaw) / Number(q.amountIn)).toFixed(3)}`
+            );
             data = swapData.tx.data;
         } else if (q.dex === "AERODROME") {
             data = AbiCoder.defaultAbiCoder().encode(
@@ -718,6 +727,14 @@ async function buildOpportunity(
         tokenPriceUSD = await tokenUsdPrice(tokenIn);
     }
     const netProfitUSD = Number(formatUnits(profit, await getDecimals(tokenIn))) * tokenPriceUSD;
+
+    // Latency baseline: when the CURRENT-BEST quote was taken (attached at
+    // scan time); the age at build caps how stale the simulation is.
+    const quoteAgeMs = Math.max(
+        (forward as any).quotedAtMs ? buildStartMs - (forward as any).quotedAtMs : 0,
+        (reverse as any).quotedAtMs ? buildStartMs - (reverse as any).quotedAtMs : 0
+    );
+    console.log(`[latency] build start: quoteAge=${quoteAgeMs}ms (${forward.dex}→${reverse.dex})`);
 
     return {
         route: {
@@ -1203,6 +1220,7 @@ async function main() {
         const [dexBuyQuotes, qInchBuy] = await Promise.all([
             Promise.all(dexProviders.map(async (dex) => {
                 const qBuy = await quoteOn(dex, WATCH_PAIR_A, WATCH_PAIR_B, amountIn);
+                if (qBuy) (qBuy as any).quotedAtMs = Date.now();
                 return qBuy ? { dex: dex.getDexName(), q: qBuy } : null;
             })),
             quoteOneInch({ tokenIn: WATCH_PAIR_A, tokenOut: WATCH_PAIR_B, amountIn })
@@ -1240,10 +1258,11 @@ async function main() {
         //  the implied rate is sufficient to detect large cross-DEX discrepancies.)
         for (const buy of saneBuyQuotes) {
             // Quote every sell source in parallel for this buy leg.
-            const [dexSellQuotes, qInchSell] = await Promise.all([
+            const [dexSellQuotes, qInchSellCell] = await Promise.all([
                 Promise.all(dexProviders.map(async (sellDex) => {
                     if (buy.dex === sellDex.getDexName()) return null;
                     const sellQuote = await quoteOn(sellDex, WATCH_PAIR_B, WATCH_PAIR_A, buy.q.amountOut);
+                    if (sellQuote) (sellQuote as any).quotedAtMs = Date.now();
                     return sellQuote ? { dex: sellDex.getDexName(), q: sellQuote } : null;
                 })),
                 // 1inch as the reverse leg (skipped when 1inch was already the buy leg).
@@ -1253,7 +1272,7 @@ async function main() {
             ]);
             const sellQuotes: { dex: string; q: QuoteResult }[] = [
                 ...dexSellQuotes.filter((x): x is { dex: string; q: QuoteResult } => x !== null),
-                ...(qInchSell && buy.dex !== "1INCH" ? [{ dex: "1INCH", q: qInchSell }] : [])
+                ...(qInchSellCell && buy.dex !== "1INCH" ? [{ dex: "1INCH", q: qInchSellCell }] : [])
             ];
             for (const sell of filterQuoteOutliers(sellQuotes, "sell")) {
                 const amountBack = sell.q.amountOut; // in token A
