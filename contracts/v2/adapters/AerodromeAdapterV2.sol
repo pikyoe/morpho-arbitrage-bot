@@ -118,7 +118,7 @@ contract AerodromeAdapterV2 is
                 );
 
         if (amounts.length == 0) {
-            revert Errors.ZeroOutput();
+            revert Errors.AdapterOutputZero();
         }
 
         amountOut =

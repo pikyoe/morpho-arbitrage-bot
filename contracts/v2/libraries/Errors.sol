@@ -17,7 +17,12 @@ library Errors {
 
     error InsufficientProfit();
 
-    error ZeroOutput();
+    // stepIndex identifies which swap leg under-delivered; amountOut is the
+    // actual leg output versus the engine's expected minAmountOut.
+    error ZeroOutput(uint256 stepIndex, uint256 amountOut, uint256 minAmountOut);
+
+    // Adapter-level zero output (no route data; adapter does not know its index).
+    error AdapterOutputZero();
 
     error InvalidSlippage();
 
