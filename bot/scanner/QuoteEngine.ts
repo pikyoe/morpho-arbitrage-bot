@@ -4,7 +4,6 @@ import {
     IQuoteProvider
 } from "./quote/index.js";
 import { DexQuoteProvider } from "./quote/DexQuoteProvider.js";
-import { quoteRateLimiter } from "../utils/RateLimiter.js";
 
 export class QuoteEngine {
 
@@ -38,27 +37,30 @@ export class QuoteEngine {
 
     ): Promise<QuoteResult[]> {
 
-        const quotes: QuoteResult[] = [];
+        // Providers are self-rate-limited (DEX quoters via quoteRateLimiter,
+        // aggregators via their own API limiters), so an extra engine-level
+        // wait() only stalled every scan without lowering total request volume.
+        // Query them concurrently — a per-provider failure no longer blocks
+        // the rest of the batch.
+        const responses = await Promise.all(
+            this.providers.map(async (provider) => {
+                try {
+                    return await provider.quote(request);
+                } catch (error) {
+                    console.warn(
+                        "Quote provider failed for",
+                        request.tokenIn,
+                        "->",
+                        request.tokenOut,
+                        "error:",
+                        error
+                    );
+                    return [] as QuoteResult[];
+                }
+            })
+        );
 
-        for (const provider of this.providers) {
-
-            await quoteRateLimiter.wait();
-
-            try {
-                const response = await provider.quote(request);
-                quotes.push(...response);
-            } catch (error) {
-                console.warn(
-                    "Quote provider failed for",
-                    request.tokenIn,
-                    "->",
-                    request.tokenOut,
-                    "error:",
-                    error
-                );
-            }
-
-        }
+        const quotes: QuoteResult[] = responses.flat();
 
         quotes.sort(
 

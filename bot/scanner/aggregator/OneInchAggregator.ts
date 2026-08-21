@@ -1,5 +1,5 @@
 import { QuoteRequest, QuoteResult } from "../quote/index.js";
-import { oneInchRateLimiter } from "../../utils/RateLimiter.js";
+import { oneInchExecRateLimiter, oneInchRateLimiter } from "../../utils/RateLimiter.js";
 
 interface OneInchQuoteResponse {
     fromToken: {
@@ -200,8 +200,9 @@ export class OneInchAggregator {
         }
 
         try {
-            // Rate limit 1inch API calls to stay within the free-tier quota.
-            await oneInchRateLimiter.wait();
+            // Execution path gets its own budget: a detected spread must not
+            // queue behind routine scan quotes while its calldata goes stale.
+            await oneInchExecRateLimiter.wait();
 
             const url = this.buildSwapUrl(request, fromAddress, slippage, options);
 
