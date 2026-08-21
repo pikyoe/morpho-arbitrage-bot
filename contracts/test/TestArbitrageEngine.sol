@@ -31,7 +31,8 @@ contract TestArbitrageEngine is ArbitrageEngineV2 {
     {
         return _executeSwap(
             step,
-            step.amountIn
+            step.amountIn,
+            0
         );
     }
 
