@@ -45,3 +45,7 @@ export const quoteRateLimiter = new RateLimiter(10, 1000); // 10 quotes per seco
 export const stateRateLimiter = new RateLimiter(15, 1000); // 15 state updates per second
 export const zeroXRateLimiter = new RateLimiter(1, 2000); // 1 request per 2 seconds (30 req/min - conservative for free tier)
 export const oneInchRateLimiter = new RateLimiter(5, 1000); // 5 requests per second (conservative for the free tier)
+// Execution-only limiter: routine scanning saturates `oneInchRateLimiter`, and
+// without a separate budget a detected opportunity would queue behind scan
+// quotes when fetching its execution calldata.
+export const oneInchExecRateLimiter = new RateLimiter(5, 1000);

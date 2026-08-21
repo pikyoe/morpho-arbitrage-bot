@@ -2,6 +2,7 @@ import * as dotenv from "dotenv";
 import {
     JsonRpcProvider,
     FallbackProvider,
+    WebSocketProvider,
     Wallet,
     Contract,
     AbiCoder,
@@ -141,6 +142,7 @@ async function preflightSimulation(
     route: any
 ): Promise<string | null> {
     if (process.env.PREFLIGHT_SIMULATION === "false") return null;
+    const startMs = Date.now();
     try {
         await engineContract.executeArbitrage.staticCall(token, amount, route);
         return null;
@@ -149,6 +151,8 @@ async function preflightSimulation(
         return decoded
             ? `revert ${decoded}() — ${e?.message || String(e)}`
             : (e?.message || String(e));
+    } finally {
+        console.log(`[latency] preflight-simulation: ${Date.now() - startMs}ms`);
     }
 }
 
@@ -176,6 +180,33 @@ const provider = rpcProviders.length > 1
         weight: 1
     })))
     : rpcProviders[0];
+
+// WebSocket is reserved for block-driven scan triggers; all HTTP reads,
+// quotes, gas estimation and execution use the fallback RPC set (same split
+// as runBot.ts). Without BASE_WS_RPC_URL the loop falls back to the poll timer.
+const wsProvider: WebSocketProvider | null = process.env.BASE_WS_RPC_URL
+    ? new WebSocketProvider(process.env.BASE_WS_RPC_URL)
+    : null;
+// A dropped WS must not crash the watcher — scan ticks still fall back to the
+// poll timer via Promise.race in waitForNextScan. The node "ws" client's
+// socket interface is untyped in ethers, so attach defensively.
+const wsSocket: any = wsProvider?.websocket;
+wsSocket?.addEventListener?.("error", (e: any) => {
+    console.log(`⚠️ WebSocket error (${e?.message || "socket error"}) — block-driven ticks degrade to the poll timer until it recovers`);
+});
+
+/** Wait until the next scan tick: new block over WS, or POLL_INTERVAL timer otherwise. */
+async function waitForNextScan(): Promise<void> {
+    if (!wsProvider) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        return;
+    }
+    await Promise.race([
+        new Promise<void>(resolve => wsProvider.once("block", () => resolve())),
+        new Promise<void>(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
+    ]);
+}
+
 const wallet = PRIVATE_KEY ? new Wallet(PRIVATE_KEY, provider) : null;
 const poolCache = new PoolCache();
 
@@ -536,6 +567,7 @@ async function scanAllPairs(
     let totalQualified = 0;
     const batches = batchPairs(filtered as any, SCAN_BATCH_SIZE);
 
+    console.time("quote-total");
     for (let b = 0; b < batches.length; b++) {
         const batch = batches[b];
         const batchResults = await Promise.all(
@@ -626,6 +658,7 @@ async function scanAllPairs(
             console.log(`  batch ${b + 1}/${batches.length}: ${batch.length} pair, qualified=${totalQualified}, bestBatch=$${bestInBatch.toFixed(2)}`);
         }
     }
+    console.timeEnd("quote-total");
 
     // Sort desc by net USD, keep only top N.
     candidates.sort((a, b) => (b.netProfitUSD || 0) - (a.netProfitUSD || 0));
@@ -661,12 +694,15 @@ async function buildOpportunity(
                 throw new Error("1inch aggregator not configured (INCH_API_KEY/INCH_API_BASE_URL)");
             }
             const swapDataStartMs = Date.now();
+            const swapDataTimer = `1inch-swapdata-fetch ${q.tokenIn.slice(0, 6)}→${q.tokenOut.slice(0, 6)}`;
+            console.time(swapDataTimer);
             const swapData = await oneInchAggregator.getSwapData(
                 { tokenIn: q.tokenIn, tokenOut: q.tokenOut, amountIn: amountInRaw },
                 oneInchAdapter,
                 Math.round(SLIPPAGE_PCT * 100), // 1inch slippage in basis points
                 { receiver: oneInchAdapter, deadline }
             );
+            console.timeEnd(swapDataTimer);
             const swapDataMs = Date.now() - swapDataStartMs;
             if (!swapData?.tx?.data) {
                 throw new Error(`1inch swap data unavailable for ${q.tokenIn.slice(0, 6)}→${q.tokenOut.slice(0, 6)}`);
@@ -714,10 +750,13 @@ async function buildOpportunity(
     const reverseMinOut = reverse.dex === "1INCH" && reverse.amountIn > 0n
         ? slip((reverse.amountOut * reverseExactIn) / reverse.amountIn)
         : slip(reverse.amountOut);
-    const steps = [
-        await buildStep(forward, amountIn, slip(forward.amountOut)),
-        await buildStep(reverse, reverseExactIn, reverseMinOut)
-    ];
+    // Fetch both legs concurrently: 1inch calldata is amount-specific and
+    // decays with time, so awaiting leg B behind leg A only stalls execution
+    // with nothing gained for ordering.
+    const steps = await Promise.all([
+        buildStep(forward, amountIn, slip(forward.amountOut)),
+        buildStep(reverse, reverseExactIn, reverseMinOut)
+    ]);
 
     // Net profit in USD: raw profit → token units → USD. Use the
     // USDAmountConverter price table, falling back to a live quote when the
@@ -734,7 +773,7 @@ async function buildOpportunity(
         (forward as any).quotedAtMs ? buildStartMs - (forward as any).quotedAtMs : 0,
         (reverse as any).quotedAtMs ? buildStartMs - (reverse as any).quotedAtMs : 0
     );
-    console.log(`[latency] build start: quoteAge=${quoteAgeMs}ms (${forward.dex}→${reverse.dex})`);
+    console.log(`[latency] build start: quoteAge=${quoteAgeMs}ms (${forward.dex}→${reverse.dex}) | build-route: ${Date.now() - buildStartMs}ms`);
 
     return {
         route: {
@@ -834,6 +873,7 @@ async function main() {
         ? `$${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX} (ladder +$${TEST_AMOUNT_USD_STEP}/loop)`
         : `$${TEST_AMOUNT_USD}`;
     console.log(`Threshold: ${SPREAD_THRESHOLD_PCT}% | Test USD: ${testSizeLabel} | Min net: $${MIN_NET_PROFIT_USD} | Poll: ${POLL_INTERVAL_MS}ms | Slippage: ${SLIPPAGE_PCT}%`);
+    console.log(`Trigger: ${wsProvider ? `WebSocket block events (${process.env.BASE_WS_RPC_URL}) + ${POLL_INTERVAL_MS}ms fallback` : `HTTP polling every ${POLL_INTERVAL_MS}ms (set BASE_WS_RPC_URL for block-driven ticks)`}`);
     console.log(`Execution: ${ENABLE_EXECUTION ? "ENABLED" : "DISABLED (watch only)"}`);
     console.log(`Signer: ${wallet ? wallet.address : "n/a (watch-only, no PRIVATE_KEY)"}`);
     console.log();
@@ -1103,7 +1143,7 @@ async function main() {
 
             if (!best || best.netProfitUSD <= 0) {
                 if (loop % 12 === 1) console.log(`[${new Date().toISOString()}] No profitable cross-DEX pair in ${scanPairs.length} pairs (loop ${loop})`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
 
@@ -1116,17 +1156,17 @@ async function main() {
             const threshold = spreadThresholdFor(forward, reverse);
             if (spreadPct < threshold) {
                 if (VERBOSE) console.log(`  Below threshold ${threshold}%${threshold > SPREAD_THRESHOLD_PCT ? " (1INCH leg)" : ""}, skipping`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
             if (netProfitUSD < MIN_NET_PROFIT_USD) {
                 console.log(`  Net profit $${netProfitUSD.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
             if (!executor) {
                 console.log("  ⚠️ Execution not configured — would execute but watch-only mode.");
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
 
@@ -1134,14 +1174,14 @@ async function main() {
             // approved on the engine; otherwise it stays detection-only.
             if (!hasEngineAdapter(forward.dex, adapterRegistry!) || !hasEngineAdapter(reverse.dex, adapterRegistry!)) {
                 console.log(`  ⚠️ Best spread ${forward.dex}→${reverse.dex} needs an unconfigured adapter (set INCH_ADAPTER_V2_ADDRESS and approve it on the engine) — detection only, skipping execution.`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
 
             const cooldownKey = routeKey(tokenA, forward.dex, reverse.dex);
             if (inExecutionCooldown(cooldownKey)) {
                 console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping execution`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
 
@@ -1150,14 +1190,14 @@ async function main() {
                 opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
             } catch (e: any) {
                 console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
 
             const netAfterGas = await netProfitAfterGasUSD(opp, tokenA);
             if (netAfterGas < MIN_NET_PROFIT_USD) {
                 console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
 
@@ -1166,14 +1206,16 @@ async function main() {
             if (preflightReason !== null) {
                 lastExecutionFailAt.set(cooldownKey, Date.now());
                 console.log(`  ⚠️ Preflight simulation failed: ${preflightReason} — skipping execution`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
 
             console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
             let executed = false;
             try {
+                const execStartMs = Date.now();
                 const result = await executor.executeFlashLoan(opp);
+                console.log(`[latency] execute-flashloan: ${Date.now() - execStartMs}ms`);
                 if (result.success) {
                     console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
                     statsExecuted++;
@@ -1192,7 +1234,7 @@ async function main() {
                 // Failed/reverted execution: cooldown the route and pause before
                 // the next scan so a persistent failure cannot loop and burn gas.
                 lastExecutionFailAt.set(cooldownKey, Date.now());
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
             }
             // On success, rescan immediately — the spread may still be live and
             // the next quote decides whether to act again.
@@ -1209,11 +1251,12 @@ async function main() {
                 amountInSingle = await usdToTokenAmount(currentTestAmountUSD, WATCH_PAIR_A);
             } catch (e: any) {
                 console.log(`  ⚠️ Cannot size amount for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}) — skipping loop`);
-                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                await waitForNextScan();
                 continue;
             }
         }
         const amountIn = amountInSingle;
+        const quoteStartMs = Date.now();
         // Quote token A -> token B (buy) on every DEX
         const buyQuotes: { dex: string; q: QuoteResult }[] = [];
 
@@ -1234,7 +1277,7 @@ async function main() {
         const saneBuyQuotes = filterQuoteOutliers(buyQuotes, "buy");
         if (saneBuyQuotes.length < 2) {
             if (VERBOSE) console.log(`  [loop ${loop}] <2 sane buy quotes (${buyQuotes.length} raw) — skipping`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
@@ -1298,10 +1341,12 @@ async function main() {
         }
 
         if (!best) {
+            console.log(`[latency] quote-total: ${Date.now() - quoteStartMs}ms — no round-trip profit`);
             if (loop % 12 === 1) console.log(`[${new Date().toISOString()}] No cross-DEX round-trip profit on ${WATCH_PAIR_A.slice(0,6)}↔${WATCH_PAIR_B.slice(0,6)} (loop ${loop})`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
+        console.log(`[latency] quote-total: ${Date.now() - quoteStartMs}ms`);
 
         const { spreadPct, netProfitUSD, forward, reverse } = best;
         console.log(`\n[${new Date().toISOString()}] 🎯 Cross-DEX spread detected: ${forward.dex}→${reverse.dex} = ${spreadPct.toFixed(3)}% | net ~$${netProfitUSD.toFixed(2)}`);
@@ -1311,19 +1356,19 @@ async function main() {
         const threshold = spreadThresholdFor(forward, reverse);
         if (spreadPct < threshold) {
             if (VERBOSE) console.log(`  Below threshold ${threshold}%${threshold > SPREAD_THRESHOLD_PCT ? " (1INCH leg)" : ""}, skipping`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
         if (netProfitUSD < MIN_NET_PROFIT_USD) {
             console.log(`  Net profit $${netProfitUSD.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
         if (!executor) {
             console.log("  ⚠️ Execution not configured — would execute but watch-only mode.");
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
@@ -1331,14 +1376,14 @@ async function main() {
         // approved on the engine; otherwise it stays detection-only.
         if (!hasEngineAdapter(forward.dex, adapterRegistry!) || !hasEngineAdapter(reverse.dex, adapterRegistry!)) {
             console.log(`  ⚠️ Best spread ${forward.dex}→${reverse.dex} needs an unconfigured adapter (set INCH_ADAPTER_V2_ADDRESS and approve it on the engine) — detection only, skipping execution.`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
         const cooldownKey = routeKey(WATCH_PAIR_A, forward.dex, reverse.dex);
         if (inExecutionCooldown(cooldownKey)) {
             console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping execution`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
@@ -1349,14 +1394,14 @@ async function main() {
             opp = await buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
         } catch (e: any) {
             console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
         const netAfterGas = await netProfitAfterGasUSD(opp, WATCH_PAIR_A);
         if (netAfterGas < MIN_NET_PROFIT_USD) {
             console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
@@ -1365,14 +1410,16 @@ async function main() {
         if (preflightReason !== null) {
             lastExecutionFailAt.set(cooldownKey, Date.now());
             console.log(`  ⚠️ Preflight simulation failed: ${preflightReason} — skipping execution`);
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
             continue;
         }
 
         console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
         let executed = false;
         try {
+            const execStartMs = Date.now();
             const result = await executor.executeFlashLoan(opp);
+            console.log(`[latency] execute-flashloan: ${Date.now() - execStartMs}ms`);
             if (result.success) {
                 console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
                 statsExecuted++;
@@ -1389,7 +1436,7 @@ async function main() {
 
         if (!executed) {
             lastExecutionFailAt.set(cooldownKey, Date.now());
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+            await waitForNextScan();
         }
         // On success, rescan immediately (see multi-pair mode).
     }

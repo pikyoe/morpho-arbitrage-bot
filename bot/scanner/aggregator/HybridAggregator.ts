@@ -24,48 +24,34 @@ export class HybridAggregator {
      * Returns the quote with the best output amount
      */
     public async getBestQuote(request: QuoteRequest): Promise<QuoteResult | null> {
-        const results: AggregatorQuote[] = [];
-
-        // Try 0x first (primary)
-        if (this.zeroX.isEnabled()) {
-            const zeroXStart = Date.now();
+        const tryAggregator = async (
+            aggregator: string,
+            fetch: () => Promise<QuoteResult | null>
+        ): Promise<AggregatorQuote> => {
+            const start = Date.now();
             try {
-                const zeroXQuote = await this.zeroX.getQuote(request);
-                results.push({
-                    aggregator: "0x",
-                    quote: zeroXQuote,
-                    latency: Date.now() - zeroXStart
-                });
+                const quote = await fetch();
+                return { aggregator, quote, latency: Date.now() - start };
             } catch (error) {
-                results.push({
-                    aggregator: "0x",
+                return {
+                    aggregator,
                     quote: null,
-                    latency: Date.now() - zeroXStart,
+                    latency: Date.now() - start,
                     error: error instanceof Error ? error.message : String(error)
-                });
+                };
             }
-        }
+        };
 
-        // Try 1inch as fallback (in parallel)
+        // Query both aggregators concurrently — their quotes are independent.
+        const attempts: Promise<AggregatorQuote>[] = [];
+        if (this.zeroX.isEnabled()) {
+            attempts.push(tryAggregator("0x", () => this.zeroX.getQuote(request)));
+        }
         const oneInch = this.oneInch;
         if (oneInch && oneInch.isEnabled()) {
-            const oneInchStart = Date.now();
-            try {
-                const oneInchQuote = await oneInch.getQuote(request);
-                results.push({
-                    aggregator: "1inch",
-                    quote: oneInchQuote,
-                    latency: Date.now() - oneInchStart
-                });
-            } catch (error) {
-                results.push({
-                    aggregator: "1inch",
-                    quote: null,
-                    latency: Date.now() - oneInchStart,
-                    error: error instanceof Error ? error.message : String(error)
-                });
-            }
+            attempts.push(tryAggregator("1inch", () => oneInch.getQuote(request)));
         }
+        const results = await Promise.all(attempts);
 
         // Filter valid quotes
         const validQuotes = results.filter(r => r.quote !== null) as AggregatorQuote[];
