@@ -32,7 +32,8 @@ const ENGINE_ERRORS = new ethers.Interface([
     "error InvalidAdapter()",
     "error RepaymentFailed()",
     "error InsufficientProfit()",
-    "error ZeroOutput()",
+    "error ZeroOutput(uint256 stepIndex, uint256 amountOut, uint256 minAmountOut)",
+    "error AdapterOutputZero()",
     "error InvalidSlippage()",
     "error RescueFailed()",
     "error DeadlineExpired()",
@@ -48,7 +49,14 @@ export function decodeEngineError(e: any): string | null {
         if (typeof data !== "string" || !data.startsWith("0x") || data.length < 10) continue;
         try {
             const parsed = ENGINE_ERRORS.parseError(data);
-            if (parsed) return parsed.name;
+            if (!parsed) continue;
+            // ZeroOutput carries the failing leg index and the shortage, which
+            // identifies whether the forward or reverse step reverted on-chain.
+            if (parsed.name === "ZeroOutput" && parsed.args?.length === 3) {
+                const [idx, out, min] = parsed.args;
+                return `ZeroOutput(stepIndex=${idx}, amountOut=${out}, minAmountOut=${min})`;
+            }
+            return parsed.name;
         } catch {
             // Not an engine custom error.
         }

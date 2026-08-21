@@ -121,7 +121,7 @@ contract OneInchAdapterV2 is
 
         amountOut = IERC20(step.tokenOut).balanceOf(address(this));
         if (amountOut < step.minAmountOut) {
-            revert Errors.ZeroOutput();
+            revert Errors.AdapterOutputZero();
         }
 
         IERC20(step.tokenOut)

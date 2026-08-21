@@ -297,11 +297,11 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, Pausable {
         currentAmount = initialAmount;
 
         for (uint256 i = 0; i < route.swaps.length; i++) {
-            currentAmount = _executeSwap(route.swaps[i], currentAmount);
+            currentAmount = _executeSwap(route.swaps[i], currentAmount, i);
         }
     }
 
-    function _executeSwap(Strategy.SwapStep memory step, uint256 currentAmount)
+    function _executeSwap(Strategy.SwapStep memory step, uint256 currentAmount, uint256 stepIndex)
         internal
         returns (uint256 amountOut)
     {
@@ -322,7 +322,7 @@ contract ArbitrageEngineV2 is Ownable, IFlashLoanReceiver, Pausable {
         amountOut = IAdapter(step.adapter).swap(step);
 
         if (amountOut < step.minAmountOut) {
-            revert Errors.ZeroOutput();
+            revert Errors.ZeroOutput(stepIndex, amountOut, step.minAmountOut);
         }
 
         IERC20(step.tokenIn).forceApprove(step.adapter, 0);
