@@ -665,6 +665,7 @@ async function buildOpportunity(
             if (!swapData?.tx?.data) {
                 throw new Error(`1inch swap data unavailable for ${q.tokenIn.slice(0, 6)}→${q.tokenOut.slice(0, 6)}`);
             }
+            console.log(`[1inch-debug] amountInRaw=${amountInRaw}, quoted reverse.amountIn=${q.amountIn}, ratio=${Number(amountInRaw) / Number(q.amountIn)}`);
             data = swapData.tx.data;
         } else if (q.dex === "AERODROME") {
             data = AbiCoder.defaultAbiCoder().encode(
@@ -695,9 +696,11 @@ async function buildOpportunity(
     // first (DEX) leg delivers slightly less than the quoted amount, the engine's
     // balance check (amountIn > balance → revert) tolerates a shortfall up to
     // SLIPPAGE_PCT instead of reverting the whole transaction and burning gas.
+    // slippageBps is in basis points (per 10_000); dividing by 1000 here was a
+    // 10× over-discount (0.5% turned into 5%).
     const slippageBps = BigInt(Math.round(SLIPPAGE_PCT * 100));
     const reverseExactIn = reverse.dex === "1INCH"
-        ? (reverse.amountIn * (1000n - slippageBps)) / 1000n
+        ? (reverse.amountIn * (10_000n - slippageBps)) / 10_000n
         : 0n;
     const reverseMinOut = reverse.dex === "1INCH" && reverse.amountIn > 0n
         ? slip((reverse.amountOut * reverseExactIn) / reverse.amountIn)
