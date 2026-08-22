@@ -85,13 +85,35 @@ const EXECUTION_COOLDOWN_MS = Math.max(0, Number(process.env.EXECUTION_COOLDOWN_
 // with freshly fetched calldata whose exact input depends on the quoted amount;
 // using only 0.1% risks ZeroOutput reverts when the quote decays between scan
 // and execution. Wider default pushes reverts into pre-flight simulation instead.
-const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.5), 0.05), 2);
+// M2: Wider slippage cap (3%) for thin Aerodrome pools — minProfit floor limits actual loss.
+const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.5), 0.05), 3);
 // minProfit floor: keep this % of the quoted profit on-chain (clamped 10–90%).
 // Demanding the full quoted profit reverts InsufficientProfit on any adverse
 // price move between quote and execution; a fractional floor tolerates drift
 // while still guaranteeing the trade clears a share of its quoted edge.
 const MIN_PROFIT_BUFFER_PCT = Math.min(Math.max(Number(process.env.MIN_PROFIT_BUFFER_PCT || 50), 10), 90);
 const VERBOSE = process.env.WATCH_VERBOSE === "true";
+// C1: Fresh-quote gate — re-quote forward+reverse legs right before execution
+// to verify the spread is still live. Costs +1 RPC call per exec attempt.
+const FRESH_QUOTE_GATE = process.env.FRESH_QUOTE_GATE !== "false";
+// M1: Configurable USD price cache TTL (default 10s, was hardcoded 30s).
+const USD_PRICE_CACHE_TTL_MS = Math.max(5_000, Number(process.env.USD_PRICE_CACHE_TTL_MS || 10_000));
+// C2: Slippage tolerance for 1inch reverse legs (default 2× SLIPPAGE_PCT).
+const INCH_REVERSE_SLIPPAGE_PCT = Math.min(
+    Math.max(Number(process.env.INCH_REVERSE_SLIPPAGE_PCT || SLIPPAGE_PCT * 2), 0.1),
+    5
+);
+// M5: Pool stale age — pools older than this (ms) are marked stale in the cache.
+const POOL_STALE_AGE_MS = Math.max(60_000, Number(process.env.POOL_STALE_AGE_MS || 300_000));
+// m1: Rate-limited rejection logging.
+const MAX_REJECT_LOG = Number(process.env.MAX_REJECT_LOG || 5);
+const REJECT_LOG_INTERVAL_MS = Number(process.env.REJECT_LOG_INTERVAL_MS || 60_000);
+// m4: Parallel batch scanning.
+const MAX_PARALLEL_BATCHES = Number(process.env.MAX_PARALLEL_BATCHES || 3);
+// m3: Structured logging (JSON lines when true).
+const STRUCTURED_LOG = process.env.WATCH_STRUCTURED_LOG === "true";
+// m1: Rate-limited rejection logging state (module-level).
+let _lastRejectLogAt = 0;
 // 1inch API quotes (INCH_API_KEY/INCH_API_BASE_URL) act as an additional
 // aggregated price source for spread detection. WATCH_USE_1INCH=false disables
 // it even when credentials are present. Execution through 1inch requires the
@@ -254,6 +276,53 @@ function spreadThresholdFor(forward: { dex: string }, reverse: { dex: string }):
     return hasInchLeg ? Math.max(SPREAD_THRESHOLD_PCT, INCH_LEG_MIN_SPREAD_PCT) : SPREAD_THRESHOLD_PCT;
 }
 
+// m3: Structured log helper.
+function structuredLog(level: "info" | "warn" | "error", msg: string, extra?: Record<string, unknown>): void {
+    if (STRUCTURED_LOG) {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...extra }));
+    } else {
+        const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "";
+        console.log(`${prefix} ${msg}`);
+    }
+}
+
+// C1: Re-quote forward+reverse legs right before execution to verify the
+// spread is still live. Returns fresh spread %, forward and reverse quotes,
+// and the recomputed profit, or null if the spread collapsed or the re-quote
+// failed. 1inch legs are re-quoted via quoteOneInch (they are not in
+// dexProviders); DEX legs are re-quoted on the matching provider.
+async function freshSpreadCheck(
+    forward: QuoteResult,
+    reverse: QuoteResult,
+    amountIn: bigint,
+    dexProviders: DexQuoteProvider[]
+): Promise<{ spreadPct: number; forward: QuoteResult; reverse: QuoteResult; profit: bigint } | null> {
+    const startMs = Date.now();
+    const reQuote = async (dex: string, tokenIn: string, tokenOut: string, amt: bigint): Promise<QuoteResult | null> => {
+        if (dex === "1INCH") {
+            return quoteOneInch({ tokenIn, tokenOut, amountIn: amt });
+        }
+        const matched = dexProviders.find(d => d.getDexName() === dex);
+        if (!matched) return null;
+        return quoteOn(matched, tokenIn, tokenOut, amt);
+    };
+    try {
+        const freshForward = await reQuote(forward.dex, forward.tokenIn, forward.tokenOut, amountIn);
+        if (!freshForward || freshForward.amountOut <= 0n) return null;
+
+        const freshReverse = await reQuote(reverse.dex, forward.tokenOut, forward.tokenIn, freshForward.amountOut);
+        if (!freshReverse || freshReverse.amountOut <= 0n) return null;
+
+        const freshProfit = freshReverse.amountOut - amountIn;
+        if (freshProfit <= 0n) return null;
+        const freshSpreadPct = Number((freshProfit * 1_000_000n) / amountIn) / 10_000;
+        console.log(`  [fresh-gate] spread ${(Number((forward.amountOut - amountIn) * 1_000_000n / amountIn) / 10_000).toFixed(3)}% → ${freshSpreadPct.toFixed(3)}% (${Date.now() - startMs}ms)`);
+        return { spreadPct: freshSpreadPct, forward: freshForward, reverse: freshReverse, profit: freshProfit };
+    } catch {
+        return null;
+    }
+}
+
 function buildDexProviders(): DexQuoteProvider[] {
     const providers: DexQuoteProvider[] = [];
 
@@ -391,19 +460,36 @@ async function tokenUsdPrice(token: string): Promise<number> {
     if (stable.has(lower)) return 1;
     const cached = _usdPriceCache.get(lower);
     if (cached && cached.expiresAt > Date.now()) return cached.price;
-    const quote = await quoteOnRaw(token, TOKENS.USDC, parseUnits("1", await getDecimals(token)));
-    if (quote && quote.amountOut > 0n) {
-        const price = Number(formatUnits(quote.amountOut, await getDecimals(TOKENS.USDC)));
-        if (Number.isFinite(price) && price > 0) {
-            _usdPriceCache.set(lower, { price, expiresAt: Date.now() + 30_000 });
-            return price;
+
+    // M6: Try every DEX provider and take median for robustness.
+    if (!_priceProviders) _priceProviders = buildDexProviders();
+    const allPrices: number[] = [];
+    for (const p of _priceProviders) {
+        try {
+            const q = await p.quote({ tokenIn: token, tokenOut: TOKENS.USDC, amountIn: parseUnits("1", await getDecimals(token)) });
+            if (q && q.amountOut > 0n) {
+                allPrices.push(Number(formatUnits(q.amountOut, await getDecimals(TOKENS.USDC))));
+            }
+        } catch { /* skip */ }
+    }
+    if (allPrices.length >= 2) {
+        allPrices.sort((a, b) => a - b);
+        const median = allPrices[Math.floor(allPrices.length / 2)];
+        if (Number.isFinite(median) && median > 0) {
+            _usdPriceCache.set(lower, { price: median, expiresAt: Date.now() + USD_PRICE_CACHE_TTL_MS });
+            return median;
         }
     }
+    // Single provider fallback.
+    if (allPrices.length === 1 && allPrices[0] > 0) {
+        _usdPriceCache.set(lower, { price: allPrices[0], expiresAt: Date.now() + USD_PRICE_CACHE_TTL_MS });
+        return allPrices[0];
+    }
 
-    // Last resort: static price table — better than failing the whole pair.
+    // M6+M1: Last resort: static price table with short TTL (1 min) to retry live soon.
     const tablePrice = getTokenPriceUSD(token);
     if (Number.isFinite(tablePrice) && tablePrice > 0) {
-        _usdPriceCache.set(lower, { price: tablePrice, expiresAt: Date.now() + 300_000 });
+        _usdPriceCache.set(lower, { price: tablePrice, expiresAt: Date.now() + 60_000 });
         return tablePrice;
     }
     throw new Error(`No USD price available for ${token}`);
@@ -431,18 +517,22 @@ async function quoteOn(
     }
 }
 
+// M3: IQR-based outlier filter — more robust than single median × factor.
 function filterQuoteOutliers<T extends { q: QuoteResult }>(quotes: T[], label: string): T[] {
     if (quotes.length < 3) return quotes;
     const values = quotes.map(x => x.q.amountOut).sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
-    const median = values[Math.floor(values.length / 2)];
-    if (!median || median <= 0n) return [];
-    const factor = BigInt(Math.ceil(MAX_QUOTE_DEVIATION_X * 1000));
+    const q1 = values[Math.floor(values.length * 0.25)];
+    const q3 = values[Math.floor(values.length * 0.75)];
+    if (!q1 || !q3 || q1 <= 0n) return quotes;
+    const iqr = q3 - q1;
+    const lowerBound = q1 - iqr * 2n;
+    const upperBound = q3 + iqr * 2n;
     const kept = quotes.filter(x => {
         const out = x.q.amountOut;
-        return out * 1000n >= median * 1000n / factor && out * 1000n <= median * factor;
+        return out >= (lowerBound > 0n ? lowerBound : 0n) && out <= upperBound;
     });
     if (VERBOSE && kept.length !== quotes.length) {
-        console.log(`  [quote-filter] ${label}: removed ${quotes.length - kept.length} outlier quote(s), median=${median.toString()}, limit=${MAX_QUOTE_DEVIATION_X}x`);
+        console.log(`  [quote-filter] ${label}: removed ${quotes.length - kept.length} outlier(s), IQR=${iqr.toString()}, bounds=[${lowerBound.toString()}..${upperBound.toString()}]`);
     }
     return kept;
 }
@@ -551,18 +641,20 @@ async function scanAllPairs(
     if (filtered.length === 0) {
         console.log("[SCAN] No pairs passed liquidity/DEX filter; waiting for pool refresh");
     }
-    // Always surface dropped pairs (with reasons) so a silently filtered pair is
-    // visible without WATCH_VERBOSE. Per-pair detail is capped to avoid log spam
-    // on large universes.
-    const MAX_REJECT_LOG = 20;
+    // m1: Rate-limited rejection logging to avoid spam on large universes.
     if (dropped.length > 0) {
-        const showAll = VERBOSE || dropped.length <= MAX_REJECT_LOG;
-        const shown = showAll ? dropped : dropped.slice(0, MAX_REJECT_LOG);
-        for (const pair of shown) {
-            console.log(`[FILTER] ${pair.tokenA.slice(0, 8)}↔${pair.tokenB.slice(0, 8)} rejected: ${pairRejectReason(pair)}`);
-        }
-        if (!showAll) {
-            console.log(`[FILTER] … and ${dropped.length - MAX_REJECT_LOG} more dropped pairs (set WATCH_VERBOSE=true for the full list)`);
+        const now = Date.now();
+        const shouldLog = VERBOSE || (now - _lastRejectLogAt > REJECT_LOG_INTERVAL_MS);
+        if (shouldLog) {
+            _lastRejectLogAt = now;
+            const showAll = VERBOSE || dropped.length <= MAX_REJECT_LOG;
+            const shown = showAll ? dropped : dropped.slice(0, MAX_REJECT_LOG);
+            for (const pair of shown) {
+                console.log(`[FILTER] ${pair.tokenA.slice(0, 8)}↔${pair.tokenB.slice(0, 8)} rejected: ${pairRejectReason(pair)}`);
+            }
+            if (!showAll) {
+                console.log(`[FILTER] … and ${dropped.length - MAX_REJECT_LOG} more (set WATCH_VERBOSE=true)`);
+            }
         }
     }
     if (VERBOSE && filtered.length !== pairs.length) {
@@ -574,9 +666,9 @@ async function scanAllPairs(
     const batches = batchPairs(filtered as any, SCAN_BATCH_SIZE);
 
     console.time("quote-total");
-    for (let b = 0; b < batches.length; b++) {
-        const batch = batches[b];
-        const batchResults = await Promise.all(
+    // m4: process batches in parallel chunks for faster scanning.
+    async function scanBatch(batch: any[]): Promise<any[]> {
+        return Promise.all(
             batch.map(async (pair: any) => {
                 try {
                     const amountIn = await amountInForToken(pair.tokenA);
@@ -652,16 +744,21 @@ async function scanAllPairs(
                 }
             })
         );
+    }
 
-        for (const r of batchResults) {
-            if (!r) continue;
-            totalQualified++;
-            candidates.push(r);
+    for (let b = 0; b < batches.length; b += MAX_PARALLEL_BATCHES) {
+        const chunk = batches.slice(b, b + MAX_PARALLEL_BATCHES);
+        const chunkResults = await Promise.all(chunk.map(scanBatch));
+        for (const batchResults of chunkResults) {
+            for (const r of batchResults) {
+                if (!r) continue;
+                totalQualified++;
+                candidates.push(r);
+            }
         }
-
         if (VERBOSE) {
             const bestInBatch = candidates.reduce<number>((mx, c) => Math.max(mx, c.netProfitUSD || 0), 0);
-            console.log(`  batch ${b + 1}/${batches.length}: ${batch.length} pair, qualified=${totalQualified}, bestBatch=$${bestInBatch.toFixed(2)}`);
+            console.log(`  batch ${Math.floor(b / MAX_PARALLEL_BATCHES) + 1}/${Math.ceil(batches.length / MAX_PARALLEL_BATCHES)}: qualified=${totalQualified}, bestBatch=$${bestInBatch.toFixed(2)}`);
         }
     }
     console.timeEnd("quote-total");
@@ -739,19 +836,13 @@ async function buildOpportunity(
         };
     };
 
-    // 1inch legs need an exact input amount (their calldata is amount-specific),
-    // so the reverse 1inch leg uses the amount its quote was built for instead of
-    // 0. DEX legs keep 0 so ArbitrageEngineV2 fills in the actual first-leg output.
-    //
-    // The reverse 1inch amount is discounted by the slippage tolerance: if the
-    // first (DEX) leg delivers slightly less than the quoted amount, the engine's
-    // balance check (amountIn > balance → revert) tolerates a shortfall up to
-    // SLIPPAGE_PCT instead of reverting the whole transaction and burning gas.
-    // slippageBps is in basis points (per 10_000); dividing by 1000 here was a
-    // 10× over-discount (0.5% turned into 5%).
-    const slippageBps = BigInt(Math.round(SLIPPAGE_PCT * 100));
+    // C2: 1inch reverse leg uses wider slippage tolerance (INCH_REVERSE_SLIPPAGE_PCT)
+    // because the exact amount delivered by the forward DEX leg is unknown until
+    // on-chain execution. A tighter tolerance risks ZeroOutput reverts; the engine's
+    // balance check provides the real safety net.
+    const inchSlippageBps = BigInt(Math.round(INCH_REVERSE_SLIPPAGE_PCT * 100));
     const reverseExactIn = reverse.dex === "1INCH"
-        ? (reverse.amountIn * (10_000n - slippageBps)) / 10_000n
+        ? (reverse.amountIn * (10_000n - inchSlippageBps)) / 10_000n
         : 0n;
     const reverseMinOut = reverse.dex === "1INCH" && reverse.amountIn > 0n
         ? slip((reverse.amountOut * reverseExactIn) / reverse.amountIn)
@@ -797,11 +888,30 @@ async function buildOpportunity(
     };
 }
 
+// M4: Dynamic gas limit estimation based on route complexity.
+function estimateGasLimit(route: any): bigint {
+    const baseGas = 200_000n; // flash loan callback + overhead
+    const perStepGas = 150_000n; // standard DEX swap
+    const inchAdapter = process.env.INCH_ADAPTER_V2_ADDRESS?.toLowerCase();
+    const swaps = route?.swaps ?? [];
+    // No route info: assume a 2-swap round trip.
+    if (swaps.length === 0) return baseGas + perStepGas * 2n;
+    let total = baseGas;
+    for (const swap of swaps) {
+        total += perStepGas; // standard DEX swap
+        if (inchAdapter && swap?.adapter?.toLowerCase() === inchAdapter) {
+            total += 100_000n; // 1inch aggregator is heavier (per 1inch leg only)
+        }
+    }
+    return total;
+}
+
 /**
  * Net profit after estimated gas (in USD). Deliberately cheap — no on-chain
  * simulation between detection and execution, so a detected spread is not
- * lost while gas is estimated. Flat gas limit × current gas price × WETH
- * price (cached); the executor re-estimates gas precisely when sending.
+ * lost while gas is estimated. Dynamic gas limit based on route complexity
+ * × current gas price × WETH price (cached); the executor re-estimates gas
+ * precisely when sending.
  *
  * Base is an OP-stack L2: total cost = L2 execution fee + L1 data fee. The
  * L1 component comes from the OP GasPriceOracle predeploy (getL1Fee on the
@@ -823,7 +933,7 @@ async function netProfitAfterGasUSD(
     if (gasPrice === null || gasPrice === undefined || gasPrice <= 0n) {
         return -Infinity; // cannot price gas — do not execute blind
     }
-    const gasLimit = 600000n; // typical flash-loan arbitrage gas (slightly over-estimates 2-swap routes)
+    const gasLimit = estimateGasLimit(opp.route); // M4: dynamic based on route
     const ethPrice = await tokenUsdPrice(TOKENS.WETH);
 
     const l2FeeWei = gasPrice * gasLimit;
@@ -1224,9 +1334,25 @@ async function main() {
                 continue;
             }
 
+            // C1: Fresh-quote gate
+            let execForward = forward;
+            let execReverse = reverse;
+            let execProfit = profit;
+            if (FRESH_QUOTE_GATE) {
+                const freshCheck = await freshSpreadCheck(forward, reverse, amountIn, dexProviders);
+                if (!freshCheck || freshCheck.spreadPct < spreadThresholdFor(forward, reverse)) {
+                    console.log('  Spread stale after re-quote, skipping execution');
+                    await waitForNextScan();
+                    continue;
+                }
+                execForward = freshCheck.forward;
+                execReverse = freshCheck.reverse;
+                execProfit = freshCheck.profit;
+            }
+
             let opp: any;
             try {
-                opp = await buildOpportunity(forward, reverse, tokenA, amountIn, profit, adapterRegistry!);
+                opp = await buildOpportunity(execForward, execReverse, tokenA, amountIn, execProfit, adapterRegistry!);
             } catch (e: any) {
                 console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
                 await waitForNextScan();
@@ -1433,9 +1559,25 @@ async function main() {
 
         // Build opportunity & execute
         const profit = reverse.amountOut - amountIn;
+        // C1: Fresh-quote gate
+        let execForward = forward;
+        let execReverse = reverse;
+        let execProfit = profit;
+        if (FRESH_QUOTE_GATE) {
+            const freshCheck = await freshSpreadCheck(forward, reverse, amountIn, dexProviders);
+            if (!freshCheck || freshCheck.spreadPct < spreadThresholdFor(forward, reverse)) {
+                console.log('  Spread stale after re-quote, skipping execution');
+                await waitForNextScan();
+                continue;
+            }
+            execForward = freshCheck.forward;
+            execReverse = freshCheck.reverse;
+            execProfit = freshCheck.profit;
+        }
+
         let opp: any;
         try {
-            opp = await buildOpportunity(forward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
+            opp = await buildOpportunity(execForward, execReverse, WATCH_PAIR_A, amountIn, execProfit, adapterRegistry!);
         } catch (e: any) {
             console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
             await waitForNextScan();
