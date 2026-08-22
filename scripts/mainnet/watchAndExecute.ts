@@ -223,20 +223,49 @@ wsSocket?.addEventListener?.("error", (e: any) => {
     console.log(`⚠️ WebSocket error (${e?.message || "socket error"}) — block-driven ticks degrade to the poll timer until it recovers`);
 });
 
-/** Wait until the next scan tick: new block over WS, or POLL_INTERVAL timer otherwise. */
+/** Wait until the next scan tick: new block over WS, or POLL_INTERVAL timer otherwise.
+ *  Whichever trigger wins, both the block listener and the timeout are torn down
+ *  so a stalled WS does not accumulate listeners/timers when the poll keeps winning.
+ */
 async function waitForNextScan(): Promise<void> {
     if (!wsProvider) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
         return;
     }
-    await Promise.race([
-        new Promise<void>(resolve => wsProvider.once("block", () => resolve())),
-        new Promise<void>(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
-    ]);
+    await new Promise<void>(resolve => {
+        let settled = false;
+        const onBlock = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve();
+        };
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            wsProvider.off("block", onBlock);
+            resolve();
+        }, POLL_INTERVAL_MS);
+        wsProvider.once("block", onBlock);
+    });
 }
 
 const wallet = PRIVATE_KEY ? new Wallet(PRIVATE_KEY, provider) : null;
 const poolCache = new PoolCache();
+
+// Rate-limited, secret-safe error logging for swallowed catches: provider/RPC
+// failures must not look identical to "no opportunity", but must also not spam
+// the log every scan iteration. Any URL (RPC endpoints embed API keys) is
+// redacted before printing.
+const _errorLogLastAt = new Map<string, number>();
+const ERROR_LOG_INTERVAL_MS = 60_000;
+function logRateLimited(key: string, message: string): void {
+    const now = Date.now();
+    const last = _errorLogLastAt.get(key);
+    if (last !== undefined && now - last < ERROR_LOG_INTERVAL_MS) return;
+    _errorLogLastAt.set(key, now);
+    console.log(message.replace(/https?:\/\/[^\s"')]+/gi, "<url>"));
+}
 
 // ------------------------------------------------------------------
 // 1inch aggregator (optional aggregated quote source)
@@ -255,7 +284,8 @@ async function quoteOneInch(request: QuoteRequest): Promise<QuoteResult | null> 
         const q = await oneInchAggregator.getQuote(request);
         if (q && q.amountOut > 0n) (q as any).quotedAtMs = Date.now();
         return q && q.amountOut > 0n ? q : null;
-    } catch {
+    } catch (e: any) {
+        logRateLimited("quote:1INCH", `  ⚠️ 1inch quote error (${e?.shortMessage || e?.message || String(e)}) — treating as unavailable`);
         return null;
     }
 }
@@ -443,8 +473,8 @@ async function quoteOnRaw(tokenIn: string, tokenOut: string, amountIn: bigint): 
         try {
             const q = await p.quote({ tokenIn, tokenOut, amountIn });
             if (q && q.amountOut > 0n) return q;
-        } catch {
-            // Try the next provider.
+        } catch (e: any) {
+            logRateLimited(`price:${p.getDexName()}`, `  ⚠️ USD price quote error on ${p.getDexName()} (${e?.shortMessage || e?.message || String(e)}) — trying next provider`);
         }
     }
     return null;
@@ -512,7 +542,8 @@ async function quoteOn(
             return q;
         }
         return null;
-    } catch {
+    } catch (e: any) {
+        logRateLimited(`quote:${provider_.getDexName()}`, `  ⚠️ ${provider_.getDexName()} quote error (${e?.shortMessage || e?.message || String(e)}) — treating as unavailable`);
         return null;
     }
 }
@@ -693,53 +724,59 @@ async function scanAllPairs(
                         return null;
                     }
 
-                    // Best buy = highest amountOut of B for the same amountIn of A.
-                    saneBuyQuotes.sort((a, b) => (a.q.amountOut > b.q.amountOut ? -1 : 1));
-                    const bestBuy = saneBuyQuotes[0];
-                    const buyAmountOut = bestBuy.q.amountOut;
-
-                    // Phase 2: quote B→A on every DEX (plus the 1inch aggregate)
-                    // using the SAME buyAmountOut, all sources in parallel.
-                    const [dexSellQuotes, qInchSell] = await Promise.all([
-                        Promise.all(dexProviders.map(async (dex) => {
-                            const qSell = await quoteOn(dex, pair.tokenB, pair.tokenA, buyAmountOut);
-                            if (qSell) (qSell as any).quotedAtMs = Date.now();
-                            return qSell ? { dex: dex.getDexName(), q: qSell } : null;
-                        })),
-                        quoteOneInch({ tokenIn: pair.tokenB, tokenOut: pair.tokenA, amountIn: buyAmountOut })
-                    ]);
-                    const sellQuotes: { dex: string; q: QuoteResult }[] = [
-                        ...dexSellQuotes.filter((x): x is { dex: string; q: QuoteResult } => x !== null),
-                        ...(qInchSell ? [{ dex: "1INCH", q: qInchSell }] : [])
-                    ];
-                    const saneSellQuotes = filterQuoteOutliers(sellQuotes, "sell");
-
-                    // Best round-trip: buy at bestBuy.dex, sell at the best cross-DEX.
+                    // Full cross product buy×sell (same as single mode): quote every
+                    // sell source against each buy leg's exact output, keep the
+                    // round trip with the highest gross USD profit.
                     let bestForPair: any = null;
-                    for (const sell of saneSellQuotes) {
-                        if (sell.dex === bestBuy.dex) continue; // must be cross-DEX
-                        const amountBack = sell.q.amountOut;
-                        if (amountBack <= amountIn) continue;
-                        const profit = amountBack - amountIn;
-                        const profitUSD = await tokenAmountToUsd(profit, pair.tokenA);
-                        const spreadPct = Number((profit * 1000000n) / amountIn) / 10000;
-                        if (!bestForPair || profitUSD > bestForPair.netProfitUSD) {
-                            bestForPair = {
-                                pair,
-                                spreadPct,
-                                netProfitUSD: profitUSD,
-                                forward: bestBuy.q,
-                                reverse: sell.q,
-                                amountIn,
-                                profit
-                            };
+                    for (const buy of saneBuyQuotes) {
+                        const buyAmountOut = buy.q.amountOut;
+
+                        // Phase 2: quote B→A on every DEX (plus the 1inch aggregate)
+                        // using this buy's exact amountOut, all sources in parallel.
+                        const [dexSellQuotes, qInchSell] = await Promise.all([
+                            Promise.all(dexProviders.map(async (dex) => {
+                                if (dex.getDexName() === buy.dex) return null; // must be cross-DEX
+                                const qSell = await quoteOn(dex, pair.tokenB, pair.tokenA, buyAmountOut);
+                                if (qSell) (qSell as any).quotedAtMs = Date.now();
+                                return qSell ? { dex: dex.getDexName(), q: qSell } : null;
+                            })),
+                            buy.dex !== "1INCH"
+                                ? quoteOneInch({ tokenIn: pair.tokenB, tokenOut: pair.tokenA, amountIn: buyAmountOut })
+                                : Promise.resolve(null)
+                        ]);
+                        const sellQuotes: { dex: string; q: QuoteResult }[] = [
+                            ...dexSellQuotes.filter((x): x is { dex: string; q: QuoteResult } => x !== null),
+                            ...(qInchSell && buy.dex !== "1INCH" ? [{ dex: "1INCH", q: qInchSell }] : [])
+                        ];
+
+                        for (const sell of filterQuoteOutliers(sellQuotes, "sell")) {
+                            const amountBack = sell.q.amountOut;
+                            if (amountBack <= amountIn) continue;
+                            const profit = amountBack - amountIn;
+                            const profitUSD = await tokenAmountToUsd(profit, pair.tokenA);
+                            const spreadPct = Number((profit * 1000000n) / amountIn) / 10000;
+                            if (VERBOSE) {
+                                console.log(`  ${buy.dex}→${sell.dex}: ${(spreadPct).toFixed(3)}% (~$${profitUSD.toFixed(2)} gross)`);
+                            }
+                            if (!bestForPair || profitUSD > bestForPair.grossProfitUSD) {
+                                bestForPair = {
+                                    pair,
+                                    spreadPct,
+                                    grossProfitUSD: profitUSD, // gross — gas is deducted later in netProfitAfterGasUSD
+                                    forward: buy.q,
+                                    reverse: sell.q,
+                                    amountIn,
+                                    profit
+                                };
+                            }
                         }
                     }
                     if (VERBOSE && !bestForPair) {
-                        console.log(`  [scan] ${pair.tokenA.slice(0,6)}→${pair.tokenB.slice(0,6)}: buys=${buyQuotes.map(x=>x.dex).join(",")} sells=${sellQuotes.length}, no cross-DEX profit`);
+                        console.log(`  [scan] ${pair.tokenA.slice(0,6)}→${pair.tokenB.slice(0,6)}: buys=${buyQuotes.map(x=>x.dex).join(",")}, no cross-DEX profit`);
                     }
                     return bestForPair;
-                } catch {
+                } catch (e: any) {
+                    logRateLimited(`scan:${pair.tokenA}-${pair.tokenB}`, `  ⚠️ scan error ${pair.tokenA.slice(0,6)}→${pair.tokenB.slice(0,6)} (${e?.shortMessage || e?.message || String(e)}) — pair skipped`);
                     return null;
                 }
             })
@@ -757,14 +794,14 @@ async function scanAllPairs(
             }
         }
         if (VERBOSE) {
-            const bestInBatch = candidates.reduce<number>((mx, c) => Math.max(mx, c.netProfitUSD || 0), 0);
-            console.log(`  batch ${Math.floor(b / MAX_PARALLEL_BATCHES) + 1}/${Math.ceil(batches.length / MAX_PARALLEL_BATCHES)}: qualified=${totalQualified}, bestBatch=$${bestInBatch.toFixed(2)}`);
+            const bestInBatch = candidates.reduce<number>((mx, c) => Math.max(mx, c.grossProfitUSD || 0), 0);
+            console.log(`  batch ${Math.floor(b / MAX_PARALLEL_BATCHES) + 1}/${Math.ceil(batches.length / MAX_PARALLEL_BATCHES)}: qualified=${totalQualified}, bestBatch=$${bestInBatch.toFixed(2)} (gross)`);
         }
     }
     console.timeEnd("quote-total");
 
-    // Sort desc by net USD, keep only top N.
-    candidates.sort((a, b) => (b.netProfitUSD || 0) - (a.netProfitUSD || 0));
+    // Sort desc by gross USD, keep only top N.
+    candidates.sort((a, b) => (b.grossProfitUSD || 0) - (a.grossProfitUSD || 0));
     return candidates.slice(0, TOP_N_CANDIDATES);
 }
 
@@ -977,6 +1014,11 @@ async function main() {
         }
     };
     process.on("SIGINT", () => {
+        printSummary();
+        process.exit(0);
+    });
+    // Container/orchestrator shutdowns send SIGTERM — print the same summary.
+    process.on("SIGTERM", () => {
         printSummary();
         process.exit(0);
     });
@@ -1264,15 +1306,19 @@ async function main() {
             console.log(`  💰 Test size: $${currentTestAmountUSD} (ladder $${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX})`);
         }
 
-        // Build per-token amount lazily (only for pairs actually scanned)
+        // Build per-token amount lazily (only for pairs actually scanned).
+        // Clamp at MAX_LOAN_USD (same cap as single mode) so a large quoted
+        // profit cannot drag the executed loan past the limit.
         const amountCache = new Map<string, bigint>();
         const amountFor = async (token: string): Promise<bigint> => {
             const key = token.toLowerCase();
             const cached = amountCache.get(key);
             if (cached) return cached;
             const v = await usdToTokenAmount(currentTestAmountUSD, token);
-            amountCache.set(key, v);
-            return v;
+            const maxLoanRaw = await usdToTokenAmount(MAX_LOAN_USD, token);
+            const clamped = v <= maxLoanRaw ? v : maxLoanRaw;
+            amountCache.set(key, clamped);
+            return clamped;
         };
 
         // -------- Multi-pair mode (all/list) --------
@@ -1288,121 +1334,121 @@ async function main() {
             }
 
             const topCandidates = await scanAllPairs(scanPairs, dexProviders, amountFor);
-            const best = topCandidates[0] ?? null;
 
-            if (!best || best.netProfitUSD <= 0) {
+            if (topCandidates.length === 0) {
                 if (loop % 12 === 1) console.log(`[${new Date().toISOString()}] No profitable cross-DEX pair in ${scanPairs.length} pairs (loop ${loop})`);
                 await waitForNextScan();
                 continue;
             }
 
-            const { spreadPct, netProfitUSD, forward, reverse, amountIn, profit } = best;
-            const tokenA = forward.tokenIn;
-            console.log(`\n[${new Date().toISOString()}] 🎯 Best cross-DEX spread: ${tokenA.slice(0,6)}↔${forward.tokenOut.slice(0,6)} ${forward.dex}→${reverse.dex} = ${spreadPct.toFixed(3)}% | net ~$${netProfitUSD.toFixed(2)}`);
-            statsSpreads++;
+            // Iterate every candidate: a gate failure on candidate 0 must not
+            // waste candidates 1+ from the same scan. Per-candidate gates use
+            // continue; a real execution attempt (success OR failure) breaks the
+            // loop. waitForNextScan runs exactly once afterwards.
+            for (const candidate of topCandidates) {
+                if (candidate.grossProfitUSD <= 0) break; // sorted desc — nothing profitable left
 
-            // Threshold checks (same as single mode)
-            const threshold = spreadThresholdFor(forward, reverse);
-            if (spreadPct < threshold) {
-                if (VERBOSE) console.log(`  Below threshold ${threshold}%${threshold > SPREAD_THRESHOLD_PCT ? " (1INCH leg)" : ""}, skipping`);
-                await waitForNextScan();
-                continue;
-            }
-            if (netProfitUSD < MIN_NET_PROFIT_USD) {
-                console.log(`  Net profit $${netProfitUSD.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
-                await waitForNextScan();
-                continue;
-            }
-            if (!executor) {
-                console.log("  ⚠️ Execution not configured — would execute but watch-only mode.");
-                await waitForNextScan();
-                continue;
-            }
+                const { spreadPct, grossProfitUSD, forward, reverse, amountIn, profit } = candidate;
+                const tokenA = forward.tokenIn;
+                console.log(`\n[${new Date().toISOString()}] 🎯 Cross-DEX spread: ${tokenA.slice(0,6)}↔${forward.tokenOut.slice(0,6)} ${forward.dex}→${reverse.dex} = ${spreadPct.toFixed(3)}% | gross ~$${grossProfitUSD.toFixed(2)}`);
+                statsSpreads++;
 
-            // A 1inch leg can only execute once INCH_ADAPTER_V2_ADDRESS is set and
-            // approved on the engine; otherwise it stays detection-only.
-            if (!hasEngineAdapter(forward.dex, adapterRegistry!) || !hasEngineAdapter(reverse.dex, adapterRegistry!)) {
-                console.log(`  ⚠️ Best spread ${forward.dex}→${reverse.dex} needs an unconfigured adapter (set INCH_ADAPTER_V2_ADDRESS and approve it on the engine) — detection only, skipping execution.`);
-                await waitForNextScan();
-                continue;
-            }
-
-            const cooldownKey = routeKey(tokenA, forward.tokenOut, forward.dex, reverse.dex);
-            if (inExecutionCooldown(cooldownKey)) {
-                console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping execution`);
-                await waitForNextScan();
-                continue;
-            }
-
-            // C1: Fresh-quote gate
-            let execForward = forward;
-            let execReverse = reverse;
-            let execProfit = profit;
-            if (FRESH_QUOTE_GATE) {
-                const freshCheck = await freshSpreadCheck(forward, reverse, amountIn, dexProviders);
-                if (!freshCheck || freshCheck.spreadPct < spreadThresholdFor(forward, reverse)) {
-                    console.log('  Spread stale after re-quote, skipping execution');
-                    await waitForNextScan();
+                // Threshold checks (same as single mode)
+                const threshold = spreadThresholdFor(forward, reverse);
+                if (spreadPct < threshold) {
+                    if (VERBOSE) console.log(`  Below threshold ${threshold}%${threshold > SPREAD_THRESHOLD_PCT ? " (1INCH leg)" : ""}, skipping candidate`);
                     continue;
                 }
-                execForward = freshCheck.forward;
-                execReverse = freshCheck.reverse;
-                execProfit = freshCheck.profit;
-            }
+                if (grossProfitUSD < MIN_NET_PROFIT_USD) {
+                    console.log(`  Gross profit $${grossProfitUSD.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping candidate`);
+                    continue;
+                }
+                if (!executor) {
+                    console.log("  ⚠️ Execution not configured — would execute but watch-only mode.");
+                    break; // mode-level gate: no other candidate can pass it either
+                }
 
-            let opp: any;
-            try {
-                opp = await buildOpportunity(execForward, execReverse, tokenA, amountIn, execProfit, adapterRegistry!);
-            } catch (e: any) {
-                console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
-                await waitForNextScan();
-                continue;
-            }
+                // A 1inch leg can only execute once INCH_ADAPTER_V2_ADDRESS is set and
+                // approved on the engine; otherwise it stays detection-only.
+                if (!hasEngineAdapter(forward.dex, adapterRegistry!) || !hasEngineAdapter(reverse.dex, adapterRegistry!)) {
+                    console.log(`  ⚠️ Spread ${forward.dex}→${reverse.dex} needs an unconfigured adapter (set INCH_ADAPTER_V2_ADDRESS and approve it on the engine) — detection only, skipping candidate.`);
+                    continue;
+                }
 
-            const netAfterGas = await netProfitAfterGasUSD(opp, tokenA, engineContract);
-            if (netAfterGas < MIN_NET_PROFIT_USD) {
-                console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
-                await waitForNextScan();
-                continue;
-            }
+                const cooldownKey = routeKey(tokenA, forward.tokenOut, forward.dex, reverse.dex);
+                if (inExecutionCooldown(cooldownKey)) {
+                    console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping candidate`);
+                    continue;
+                }
 
-            // Preflight simulation: skip before spending real gas if the route reverts.
-            const preflightReason = await preflightSimulation(engineContract!, tokenA, opp.inputAmount, opp.route);
-            if (preflightReason !== null) {
-                lastExecutionFailAt.set(cooldownKey, Date.now());
-                console.log(`  ⚠️ Preflight simulation failed: ${preflightReason} — skipping execution`);
-                await waitForNextScan();
-                continue;
-            }
+                // C1: Fresh-quote gate
+                let execForward = forward;
+                let execReverse = reverse;
+                let execProfit = profit;
+                if (FRESH_QUOTE_GATE) {
+                    const freshCheck = await freshSpreadCheck(forward, reverse, amountIn, dexProviders);
+                    if (!freshCheck || freshCheck.spreadPct < spreadThresholdFor(forward, reverse)) {
+                        console.log('  Spread stale after re-quote, skipping candidate');
+                        continue;
+                    }
+                    execForward = freshCheck.forward;
+                    execReverse = freshCheck.reverse;
+                    execProfit = freshCheck.profit;
+                }
 
-            console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
-            let executed = false;
-            try {
-                const execStartMs = Date.now();
-                const result = await executor.executeFlashLoan(opp);
-                console.log(`[latency] execute-flashloan: ${Date.now() - execStartMs}ms`);
-                if (result.success) {
-                    console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
-                    statsExecuted++;
-                    executed = true;
-                    lastExecutionFailAt.delete(cooldownKey);
-                } else {
-                    console.log(`  ❌ Execution failed: ${result.error}`);
+                let opp: any;
+                try {
+                    opp = await buildOpportunity(execForward, execReverse, tokenA, amountIn, execProfit, adapterRegistry!);
+                } catch (e: any) {
+                    console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping candidate`);
+                    continue;
+                }
+
+                const netAfterGas = await netProfitAfterGasUSD(opp, tokenA, engineContract);
+                if (netAfterGas < MIN_NET_PROFIT_USD) {
+                    console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping candidate`);
+                    continue;
+                }
+
+                // Preflight simulation: skip before spending real gas if the route reverts.
+                const preflightReason = await preflightSimulation(engineContract!, tokenA, opp.inputAmount, opp.route);
+                if (preflightReason !== null) {
+                    lastExecutionFailAt.set(cooldownKey, Date.now());
+                    console.log(`  ⚠️ Preflight simulation failed: ${preflightReason} — skipping candidate`);
+                    continue;
+                }
+
+                console.log(`  Executing flash loan (${forward.dex} → ${reverse.dex})… (net after gas ~$${netAfterGas.toFixed(2)})`);
+                let executed = false;
+                try {
+                    const execStartMs = Date.now();
+                    const result = await executor.executeFlashLoan(opp);
+                    console.log(`[latency] execute-flashloan: ${Date.now() - execStartMs}ms`);
+                    if (result.success) {
+                        console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
+                        statsExecuted++;
+                        executed = true;
+                        lastExecutionFailAt.delete(cooldownKey);
+                    } else {
+                        console.log(`  ❌ Execution failed: ${result.error}`);
+                        statsFailed++;
+                    }
+                } catch (e: any) {
+                    console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
                     statsFailed++;
                 }
-            } catch (e: any) {
-                console.log(`  ❌ Execution error: ${e?.message || String(e)}`);
-                statsFailed++;
+
+                if (!executed) {
+                    // Failed/reverted execution: cooldown the route so a
+                    // persistent failure cannot loop and burn gas.
+                    lastExecutionFailAt.set(cooldownKey, Date.now());
+                }
+                break; // one execution attempt per scan — remaining candidates wait for the next scan
             }
 
-            if (!executed) {
-                // Failed/reverted execution: cooldown the route and pause before
-                // the next scan so a persistent failure cannot loop and burn gas.
-                lastExecutionFailAt.set(cooldownKey, Date.now());
-                await waitForNextScan();
-            }
-            // On success, rescan immediately — the spread may still be live and
-            // the next quote decides whether to act again.
+            // Once per scan: after an execution attempt (success or failure) or
+            // after all candidates were skipped, pause before rescanning.
+            await waitForNextScan();
             continue;
         }
 
@@ -1459,7 +1505,7 @@ async function main() {
         }
 
         // Compute cross-DEX round-trip: buy on DEX i, sell on DEX j, both with same amountIn
-        let best: { spreadPct: number; netProfitUSD: number; forward: QuoteResult; reverse: QuoteResult } | null = null;
+        let best: { spreadPct: number; grossProfitUSD: number; forward: QuoteResult; reverse: QuoteResult } | null = null;
 
         // For a fair round-trip, buy at DEX i (A→B) with amountIn,
         // then sell the received B at DEX j (B→A). The sell amountOut is in token A.
@@ -1499,10 +1545,10 @@ async function main() {
                     console.log(`  ${buy.dex}→${sell.dex}: ${await formatAmount(amountBack, WATCH_PAIR_A)} back (${spreadPct.toFixed(3)}%)`);
                 }
 
-                if (!best || profitUSD > best.netProfitUSD) {
+                if (!best || profitUSD > best.grossProfitUSD) {
                     best = {
                         spreadPct,
-                        netProfitUSD: profitUSD,
+                        grossProfitUSD: profitUSD, // gross — gas is deducted later in netProfitAfterGasUSD
                         forward: buy.q,
                         reverse: sell.q
                     };
@@ -1518,8 +1564,8 @@ async function main() {
         }
         console.log(`[latency] quote-total: ${Date.now() - quoteStartMs}ms`);
 
-        const { spreadPct, netProfitUSD, forward, reverse } = best;
-        console.log(`\n[${new Date().toISOString()}] 🎯 Cross-DEX spread detected: ${forward.dex}→${reverse.dex} = ${spreadPct.toFixed(3)}% | net ~$${netProfitUSD.toFixed(2)}`);
+        const { spreadPct, grossProfitUSD, forward, reverse } = best;
+        console.log(`\n[${new Date().toISOString()}] 🎯 Cross-DEX spread detected: ${forward.dex}→${reverse.dex} = ${spreadPct.toFixed(3)}% | gross ~$${grossProfitUSD.toFixed(2)}`);
         statsSpreads++;
 
         // Threshold check
@@ -1530,8 +1576,8 @@ async function main() {
             continue;
         }
 
-        if (netProfitUSD < MIN_NET_PROFIT_USD) {
-            console.log(`  Net profit $${netProfitUSD.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
+        if (grossProfitUSD < MIN_NET_PROFIT_USD) {
+            console.log(`  Gross profit $${grossProfitUSD.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
             await waitForNextScan();
             continue;
         }
