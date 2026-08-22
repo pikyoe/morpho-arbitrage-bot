@@ -8,7 +8,8 @@ import {
     AbiCoder,
     parseUnits,
     formatUnits,
-    getAddress
+    getAddress,
+    Transaction
 } from "ethers";
 
 import { PoolCache } from "../../bot/scanner/PoolCache.js";
@@ -70,10 +71,7 @@ const SPREAD_THRESHOLD_PCT = Number(process.env.SPREAD_THRESHOLD_PCT || 0.2); //
 // against 1inch is usually the aggregator fee itself, not real profit.
 const INCH_LEG_MIN_SPREAD_PCT = Number(process.env.INCH_LEG_MIN_SPREAD_PCT || 0.5);
 const MIN_NET_PROFIT_USD = Number(process.env.MIN_NET_PROFIT_USD || 1);
-// Same-direction quotes use identical token units. Extreme outliers are
-// generally stale/invalid pools (for example a dust quote), not real spread.
-const MAX_QUOTE_DEVIATION_X = Math.max(2, Number(process.env.MAX_QUOTE_DEVIATION_X || 10));
-const POLL_INTERVAL_MS = Number(process.env.WATCH_POLL_MS || 5000); // 5s default
+const POLL_INTERVAL_MS = Math.max(1000, Number(process.env.WATCH_POLL_MS || 5000)); // 5s default, clamped ≥1s
 const MAX_LOAN_USD = Number(process.env.WATCH_MAX_LOAN_USD || 10000);
 // Fail closed: execution requires an explicit WATCH_ENABLE_EXECUTION=true.
 const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION === "true"; // default OFF
@@ -81,11 +79,11 @@ const ENABLE_EXECUTION = process.env.WATCH_ENABLE_EXECUTION === "true"; // defau
 // blocked from re-executing for this long, so a persistent-but-unexecutable
 // spread cannot burn gas on repeated reverts.
 const EXECUTION_COOLDOWN_MS = Math.max(0, Number(process.env.EXECUTION_COOLDOWN_MS || 60000));
-// Slippage tolerance: default 0.5% (clamp [0.05%, 2%]). The 1inch leg executes
+// Slippage tolerance: default 0.5% (clamp [0.05%, 3%]). The 1inch leg executes
 // with freshly fetched calldata whose exact input depends on the quoted amount;
 // using only 0.1% risks ZeroOutput reverts when the quote decays between scan
-// and execution. Wider default pushes reverts into pre-flight simulation instead.
-// M2: Wider slippage cap (3%) for thin Aerodrome pools — minProfit floor limits actual loss.
+// and execution. The wider 3% cap accommodates thin Aerodrome pools — the
+// minProfit floor limits actual loss.
 const SLIPPAGE_PCT = Math.min(Math.max(Number(process.env.SLIPPAGE_PCT || 0.5), 0.05), 3);
 // minProfit floor: keep this % of the quoted profit on-chain (clamped 10–90%).
 // Demanding the full quoted profit reverts InsufficientProfit on any adverse
@@ -103,15 +101,11 @@ const INCH_REVERSE_SLIPPAGE_PCT = Math.min(
     Math.max(Number(process.env.INCH_REVERSE_SLIPPAGE_PCT || SLIPPAGE_PCT * 2), 0.1),
     5
 );
-// M5: Pool stale age — pools older than this (ms) are marked stale in the cache.
-const POOL_STALE_AGE_MS = Math.max(60_000, Number(process.env.POOL_STALE_AGE_MS || 300_000));
 // m1: Rate-limited rejection logging.
 const MAX_REJECT_LOG = Number(process.env.MAX_REJECT_LOG || 5);
 const REJECT_LOG_INTERVAL_MS = Number(process.env.REJECT_LOG_INTERVAL_MS || 60_000);
 // m4: Parallel batch scanning.
 const MAX_PARALLEL_BATCHES = Number(process.env.MAX_PARALLEL_BATCHES || 3);
-// m3: Structured logging (JSON lines when true).
-const STRUCTURED_LOG = process.env.WATCH_STRUCTURED_LOG === "true";
 // m1: Rate-limited rejection logging state (module-level).
 let _lastRejectLogAt = 0;
 // 1inch API quotes (INCH_API_KEY/INCH_API_BASE_URL) act as an additional
@@ -306,16 +300,6 @@ function spreadThresholdFor(forward: { dex: string }, reverse: { dex: string }):
     return hasInchLeg ? Math.max(SPREAD_THRESHOLD_PCT, INCH_LEG_MIN_SPREAD_PCT) : SPREAD_THRESHOLD_PCT;
 }
 
-// m3: Structured log helper.
-function structuredLog(level: "info" | "warn" | "error", msg: string, extra?: Record<string, unknown>): void {
-    if (STRUCTURED_LOG) {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...extra }));
-    } else {
-        const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "";
-        console.log(`${prefix} ${msg}`);
-    }
-}
-
 // C1: Re-quote forward+reverse legs right before execution to verify the
 // spread is still live. Returns fresh spread %, forward and reverse quotes,
 // and the recomputed profit, or null if the spread collapsed or the re-quote
@@ -346,7 +330,10 @@ async function freshSpreadCheck(
         const freshProfit = freshReverse.amountOut - amountIn;
         if (freshProfit <= 0n) return null;
         const freshSpreadPct = Number((freshProfit * 1_000_000n) / amountIn) / 10_000;
-        console.log(`  [fresh-gate] spread ${(Number((forward.amountOut - amountIn) * 1_000_000n / amountIn) / 10_000).toFixed(3)}% → ${freshSpreadPct.toFixed(3)}% (${Date.now() - startMs}ms)`);
+        // "Before" spread must use the scan-time round trip (reverse.amountOut -
+        // amountIn, both token-A units) — the forward leg alone mixes token units.
+        const scanSpreadPct = Number(((reverse.amountOut - amountIn) * 1_000_000n) / amountIn) / 10_000;
+        console.log(`  [fresh-gate] spread ${scanSpreadPct.toFixed(3)}% → ${freshSpreadPct.toFixed(3)}% (${Date.now() - startMs}ms)`);
         return { spreadPct: freshSpreadPct, forward: freshForward, reverse: freshReverse, profit: freshProfit };
     } catch {
         return null;
@@ -411,6 +398,7 @@ async function getDecimals(addr: string): Promise<number> {
             const dec = Number(await tokenContract.decimals());
             return Number.isFinite(dec) && dec > 0 ? dec : 18;
         } catch {
+            logRateLimited(`decimals:${lower}`, `  ⚠️ decimals() lookup failed for ${lower.slice(0, 10)}… — assuming 18 decimals`);
             return 18; // unresolvable — last resort
         }
     })();
@@ -426,15 +414,6 @@ async function getDecimals(addr: string): Promise<number> {
 
 async function formatAmount(amount: bigint, addr: string): Promise<string> {
     return Number(formatUnits(amount, await getDecimals(addr))).toFixed(6);
-}
-
-async function tokenAmountToNumber(amount: bigint, token: string): Promise<number> {
-    return Number(formatUnits(amount, await getDecimals(token)));
-}
-
-function percentageOf(numerator: bigint, denominator: bigint): number {
-    if (denominator <= 0n) return 0;
-    return Number((numerator * 1_000_000n) / denominator) / 10_000;
 }
 
 /** Convert a USD test amount into raw token units for `token`.
@@ -467,18 +446,6 @@ async function usdToTokenAmount(usd: number, token: string): Promise<bigint> {
 // deepest liquidity), then fall back to the static USDAmountConverter table.
 let _priceProviders: DexQuoteProvider[] | null = null;
 const _usdPriceCache = new Map<string, { price: number; expiresAt: number }>();
-async function quoteOnRaw(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<QuoteResult | null> {
-    if (!_priceProviders) _priceProviders = buildDexProviders();
-    for (const p of _priceProviders) {
-        try {
-            const q = await p.quote({ tokenIn, tokenOut, amountIn });
-            if (q && q.amountOut > 0n) return q;
-        } catch (e: any) {
-            logRateLimited(`price:${p.getDexName()}`, `  ⚠️ USD price quote error on ${p.getDexName()} (${e?.shortMessage || e?.message || String(e)}) — trying next provider`);
-        }
-    }
-    return null;
-}
 
 async function tokenUsdPrice(token: string): Promise<number> {
     // sUSDS excluded: yield-bearing share token (> $1), must be priced via quote.
@@ -510,8 +477,10 @@ async function tokenUsdPrice(token: string): Promise<number> {
             return median;
         }
     }
-    // Single provider fallback.
+    // Single provider fallback: a 1-token probe on one DEX can be distorted by
+    // price impact on thin pools — accept it (better than nothing) but log it.
     if (allPrices.length === 1 && allPrices[0] > 0) {
+        logRateLimited(`price:1src:${lower}`, `  ⚠️ USD price for ${lower.slice(0, 10)}… from a single DEX quote — may be distorted by price impact`);
         _usdPriceCache.set(lower, { price: allPrices[0], expiresAt: Date.now() + USD_PRICE_CACHE_TTL_MS });
         return allPrices[0];
     }
@@ -519,6 +488,7 @@ async function tokenUsdPrice(token: string): Promise<number> {
     // M6+M1: Last resort: static price table with short TTL (1 min) to retry live soon.
     const tablePrice = getTokenPriceUSD(token);
     if (Number.isFinite(tablePrice) && tablePrice > 0) {
+        logRateLimited(`price:table:${lower}`, `  ⚠️ USD price for ${lower.slice(0, 10)}… from the static table (no live quote available)`);
         _usdPriceCache.set(lower, { price: tablePrice, expiresAt: Date.now() + 60_000 });
         return tablePrice;
     }
@@ -666,6 +636,11 @@ async function scanAllPairs(
         maxPairsPerScan: MAX_PAIRS_PER_SCAN,
         poolCache
     });
+    // filterPairs fails open on an empty cache (returns all pairs): make the
+    // degraded state visible instead of silently scanning unfiltered.
+    if (poolCache.size() === 0) {
+        logRateLimited("filter:empty-cache", "  ⚠️ Pool cache empty — liquidity/DEX-variety filters inactive this scan; quotes are the only liveness check");
+    }
     const accepted = new Set(filtered.map(pair => `${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`));
     const dropped = pairs.filter(pair => !accepted.has(`${pair.tokenA.toLowerCase()}|${pair.tokenB.toLowerCase()}`));
     console.log(`[SCAN] configured=${pairs.length}, eligible=${filtered.length}, mode=${WATCH_MODE}`);
@@ -818,7 +793,7 @@ async function buildOpportunity(
     adapterRegistry: AdapterRegistry
 ): Promise<any> {
     const buildStartMs = Date.now();
-    // Apply slippage tolerance to each leg's minimum output (capped at 1.5%).
+    // Apply slippage tolerance to each leg's minimum output (SLIPPAGE_PCT, clamped [0.05%, 3%]).
     const slip = (out: bigint) => (out * (1000n - BigInt(Math.round(SLIPPAGE_PCT * 10)))) / 1000n;
     // 300s (matches RouteBuilder): adapters revert when deadline <= block.timestamp,
     // so a short window turns mild mempool delay into a burned-gas revert.
@@ -891,6 +866,12 @@ async function buildOpportunity(
         buildStep(forward, amountIn, slip(forward.amountOut)),
         buildStep(reverse, reverseExactIn, reverseMinOut)
     ]);
+    if (reverse.dex === "1INCH") {
+        // The 1inch calldata pins the swap amount, so the reverse leg cannot use
+        // amountIn=0 (full balance). A forward-leg surplus above the quote stays
+        // in the engine as token B — recoverable via rescue, not counted as profit.
+        console.log("  ℹ️ 1inch reverse leg uses a fixed input — any surplus token B above the quote remains in the engine");
+    }
 
     // Net profit in USD: raw profit → token units → USD. Use the
     // USDAmountConverter price table, falling back to a live quote when the
@@ -946,14 +927,19 @@ function estimateGasLimit(route: any): bigint {
 /**
  * Net profit after estimated gas (in USD). Deliberately cheap — no on-chain
  * simulation between detection and execution, so a detected spread is not
- * lost while gas is estimated. Dynamic gas limit based on route complexity
- * × current gas price × WETH price (cached); the executor re-estimates gas
- * precisely when sending.
+ * lost while gas is estimated.
+ *
+ * Mirrors the executor's cost model: FlashLoanExecutor re-estimates gas
+ * on-chain and pads both the limit and the fee by 20%, so the gate applies
+ * the same +20% to the static estimate instead of pricing a bare lower bound
+ * the real transaction will exceed.
  *
  * Base is an OP-stack L2: total cost = L2 execution fee + L1 data fee. The
- * L1 component comes from the OP GasPriceOracle predeploy (getL1Fee on the
- * RLP-encoded transaction); when the oracle is unavailable we scale the L2
- * estimate by 25% so thin-margin trades are not priced gas-free.
+ * L1 component comes from the OP GasPriceOracle predeploy, which prices the
+ * bytes of the full RLP-encoded signed transaction — so we encode a
+ * dummy-signed EIP-1559 tx rather than passing bare calldata (which would
+ * undercount the envelope bytes). When the oracle is unavailable we scale
+ * the L2 estimate by 25% so thin-margin trades are not priced gas-free.
  *
  * Fail-closed: when gas cannot be priced at all, return -Infinity so the
  * trade is skipped instead of executed with an unknown gas cost (the previous
@@ -970,10 +956,12 @@ async function netProfitAfterGasUSD(
     if (gasPrice === null || gasPrice === undefined || gasPrice <= 0n) {
         return -Infinity; // cannot price gas — do not execute blind
     }
-    const gasLimit = estimateGasLimit(opp.route); // M4: dynamic based on route
+    // Same padding the executor applies at send time (+20% limit, +20% fee).
+    const gasLimit = (estimateGasLimit(opp.route) * 120n) / 100n;
+    const paddedGasPrice = (gasPrice * 120n) / 100n;
     const ethPrice = await tokenUsdPrice(TOKENS.WETH);
 
-    const l2FeeWei = gasPrice * gasLimit;
+    const l2FeeWei = paddedGasPrice * gasLimit;
     let l1FeeWei = 0n;
     if (engineContract) {
         try {
@@ -981,8 +969,22 @@ async function netProfitAfterGasUSD(
                 "executeArbitrage",
                 [token, opp.inputAmount, opp.route]
             );
+            // The dummy signature must use full-width r/s values (32 bytes
+            // each): tiny values RLP-encode shorter and would undercount the
+            // calldata bytes the real signed transaction carries.
+            const oracleTx = Transaction.from({
+                type: 2,
+                chainId: 8453, // Base mainnet (validated at startup)
+                nonce: 0,
+                to: engineContract.target as string,
+                data: txData,
+                gasLimit,
+                maxFeePerGas: paddedGasPrice,
+                maxPriorityFeePerGas: paddedGasPrice
+            });
+            oracleTx.signature = `0x${"aa".repeat(32)}${"11".repeat(32)}1b`;
             const oracle = new Contract(OP_GAS_ORACLE_ADDRESS, OP_GAS_ORACLE_ABI, provider);
-            l1FeeWei = await oracle.getL1Fee(txData);
+            l1FeeWei = await oracle.getL1Fee(oracleTx.serialized);
         } catch {
             l1FeeWei = 0n;
         }
@@ -992,6 +994,23 @@ async function netProfitAfterGasUSD(
     const totalFeeWei = l1FeeWei > 0n ? l2FeeWei + l1FeeWei : l2FeeWei + l2FeeWei / 4n;
     const gasUSD = Number(formatUnits(totalFeeWei, 18)) * ethPrice;
     return base - gasUSD;
+}
+
+/** Human label for realized profit: the on-chain-verified amount when the
+ *  ArbitrageFinished event was found, otherwise the pre-trade estimate. */
+async function describeNetProfit(
+    result: { profitVerified?: boolean; actualProfitRaw?: bigint; netProfitUSD?: number },
+    profitToken: string
+): Promise<string> {
+    if (result.profitVerified && result.actualProfitRaw !== undefined) {
+        try {
+            const usd = await tokenAmountToUsd(result.actualProfitRaw, profitToken);
+            return `net $${usd.toFixed(2)} (verified on-chain)`;
+        } catch {
+            return `net ${result.actualProfitRaw.toString()} raw units (verified on-chain, USD conversion unavailable)`;
+        }
+    }
+    return `net ~$${(result.netProfitUSD ?? 0).toFixed(2)} (estimate — ArbitrageFinished event not found)`;
 }
 
 // ------------------------------------------------------------------
@@ -1303,7 +1322,10 @@ async function main() {
             if (currentTestAmountUSD > TEST_AMOUNT_USD_MAX) {
                 currentTestAmountUSD = TEST_AMOUNT_USD_START;
             }
-            console.log(`  💰 Test size: $${currentTestAmountUSD} (ladder $${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX})`);
+            // Without a configured ladder the amount is fixed — don't log churn.
+            if (TEST_AMOUNT_USD_START < TEST_AMOUNT_USD_MAX) {
+                console.log(`  💰 Test size: $${currentTestAmountUSD} (ladder $${TEST_AMOUNT_USD_START}→$${TEST_AMOUNT_USD_MAX})`);
+            }
         }
 
         // Build per-token amount lazily (only for pairs actually scanned).
@@ -1404,7 +1426,15 @@ async function main() {
                     continue;
                 }
 
-                const netAfterGas = await netProfitAfterGasUSD(opp, tokenA, engineContract);
+                // Gas/USD pricing can throw on a transient RPC error — skip the
+                // candidate, never crash the watcher.
+                let netAfterGas: number;
+                try {
+                    netAfterGas = await netProfitAfterGasUSD(opp, tokenA, engineContract);
+                } catch (e: any) {
+                    console.log(`  ⚠️ Cannot price gas/USD (${e?.message || String(e)}) — skipping candidate`);
+                    continue;
+                }
                 if (netAfterGas < MIN_NET_PROFIT_USD) {
                     console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping candidate`);
                     continue;
@@ -1425,7 +1455,7 @@ async function main() {
                     const result = await executor.executeFlashLoan(opp);
                     console.log(`[latency] execute-flashloan: ${Date.now() - execStartMs}ms`);
                     if (result.success) {
-                        console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
+                        console.log(`  ✅ EXECUTED: ${result.txHash} | ${await describeNetProfit(result, tokenA)}`);
                         statsExecuted++;
                         executed = true;
                         lastExecutionFailAt.delete(cooldownKey);
@@ -1504,17 +1534,11 @@ async function main() {
             }
         }
 
-        // Compute cross-DEX round-trip: buy on DEX i, sell on DEX j, both with same amountIn
+        // Cross-DEX round trip: buy at DEX i (A→B) with amountIn, sell the exact
+        // received B at DEX j (B→A) — full buy×sell cross product, highest gross
+        // USD profit wins (gas is deducted later in netProfitAfterGasUSD).
         let best: { spreadPct: number; grossProfitUSD: number; forward: QuoteResult; reverse: QuoteResult } | null = null;
 
-        // For a fair round-trip, buy at DEX i (A→B) with amountIn,
-        // then sell the received B at DEX j (B→A). The sell amountOut is in token A.
-        // We need sell quotes for the amount of B received from buy. Since we quoted B→A
-        // with qBuy.amountOut on the SAME dex, that gives us the reverse on that dex. But for
-        // cross-DEX we need buy on i → sell on j. To keep it correct with the data we have,
-        // we approximate: use the sell quote on dex j for the amount of B that buy on i produced.
-        // (In practice for monitoring, quoting both directions on each dex and comparing
-        //  the implied rate is sufficient to detect large cross-DEX discrepancies.)
         for (const buy of saneBuyQuotes) {
             // Quote every sell source in parallel for this buy leg.
             const [dexSellQuotes, qInchSellCell] = await Promise.all([
@@ -1630,7 +1654,16 @@ async function main() {
             continue;
         }
 
-        const netAfterGas = await netProfitAfterGasUSD(opp, WATCH_PAIR_A, engineContract);
+        // Gas/USD pricing can throw on a transient RPC error — skip this loop,
+        // never crash the watcher.
+        let netAfterGas: number;
+        try {
+            netAfterGas = await netProfitAfterGasUSD(opp, WATCH_PAIR_A, engineContract);
+        } catch (e: any) {
+            console.log(`  ⚠️ Cannot price gas/USD (${e?.message || String(e)}) — skipping`);
+            await waitForNextScan();
+            continue;
+        }
         if (netAfterGas < MIN_NET_PROFIT_USD) {
             console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
             await waitForNextScan();
@@ -1653,7 +1686,7 @@ async function main() {
             const result = await executor.executeFlashLoan(opp);
             console.log(`[latency] execute-flashloan: ${Date.now() - execStartMs}ms`);
             if (result.success) {
-                console.log(`  ✅ EXECUTED: ${result.txHash} | net ~$${(result.netProfitUSD ?? 0).toFixed(2)}`);
+                console.log(`  ✅ EXECUTED: ${result.txHash} | ${await describeNetProfit(result, WATCH_PAIR_A)}`);
                 statsExecuted++;
                 executed = true;
                 lastExecutionFailAt.delete(cooldownKey);

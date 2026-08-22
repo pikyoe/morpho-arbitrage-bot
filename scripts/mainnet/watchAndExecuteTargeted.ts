@@ -36,7 +36,6 @@ const envDefaults: Record<string, string> = {
     // New audit config defaults for targeted mode
     FRESH_QUOTE_GATE: "true",
     USD_PRICE_CACHE_TTL_MS: "10000",
-    POOL_STALE_AGE_MS: "300000",
     MAX_PARALLEL_BATCHES: "1",
     MAX_REJECT_LOG: "5",
 };
