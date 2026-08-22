@@ -19,27 +19,42 @@ process.env.ENV_FILE ||= envPath;
 
 const { TOKENS } = await import("../../bot/scanner/TokenList.js");
 
-// Safe defaults for a focused monitor. Existing environment values win.
-process.env.WATCH_MODE ||= "list";
-process.env.WATCH_PAIRS ||= [
-    `${TOKENS.WETH},${TOKENS.USDC}`,
-    `${TOKENS.WETH},${TOKENS.USDT}`,
-    `${TOKENS.CBBTC},${TOKENS.USDC}`
-].join(";");
-process.env.SCAN_BATCH_SIZE ||= "1";
-process.env.MAX_PAIRS_PER_SCAN ||= "3";
-process.env.TOP_N_CANDIDATES ||= "1";
-process.env.WATCH_POOL_REFRESH_LOOPS ||= "12";
-process.env.WATCH_TEST_USD ||= "500";
-process.env.WATCH_POLL_MS ||= "5000";
-// Deeper subgraph pool list so the fixed pairs (e.g. CBBTC/USDC) are usually
-// present in the cache even when they sit outside the top-20 pools — without
-// spending any RPC budget (subgraph queries are GraphQL).
-process.env.SUBGRAPH_POOL_LIMIT ||= "50";
-process.env.MIN_DEX_VARIETY ||= "2";
-// Low-RPC watcher: use the 1inch API (INCH_API_KEY/INCH_API_BASE_URL) as an
-// additional aggregated quote source for spread detection.
-process.env.WATCH_USE_1INCH ||= "true";
+// m2: Explicit env defaults (check undefined/empty, not just falsy).
+const envDefaults: Record<string, string> = {
+    WATCH_MODE: "list",
+    SCAN_BATCH_SIZE: "1",
+    MAX_PAIRS_PER_SCAN: "3",
+    TOP_N_CANDIDATES: "1",
+    WATCH_POOL_REFRESH_LOOPS: "12",
+    WATCH_TEST_USD: "500",
+    WATCH_POLL_MS: "5000",
+    SUBGRAPH_POOL_LIMIT: "50",
+    MIN_DEX_VARIETY: "2",
+    WATCH_USE_1INCH: "true",
+    WATCH_ENABLE_EXECUTION: "false",
+    MIN_LIQUIDITY_USD: "10000",
+    // New audit config defaults for targeted mode
+    FRESH_QUOTE_GATE: "true",
+    USD_PRICE_CACHE_TTL_MS: "10000",
+    POOL_STALE_AGE_MS: "300000",
+    MAX_PARALLEL_BATCHES: "1",
+    MAX_REJECT_LOG: "5",
+};
+
+for (const [key, value] of Object.entries(envDefaults)) {
+    if (process.env[key] === undefined || process.env[key] === "") {
+        process.env[key] = value;
+    }
+}
+
+// WATCH_PAIRS: only set if not already defined.
+if (!process.env.WATCH_PAIRS) {
+    process.env.WATCH_PAIRS = [
+        `${TOKENS.WETH},${TOKENS.USDC}`,
+        `${TOKENS.WETH},${TOKENS.USDT}`,
+        `${TOKENS.CBBTC},${TOKENS.USDC}`
+    ].join(";");
+}
 
 // Keep startup RPC usage low unless the user explicitly opts in.
 // TARGETED_ALLOW_RPC_POOL_DISCOVERY=true enables factory RPC discovery for the
