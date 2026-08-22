@@ -129,6 +129,12 @@ const SwapStepTuple = "(address adapter,address tokenIn,address tokenOut,uint24 
 const RouteTuple = `(${SwapStepTuple}[] swaps,address profitToken,uint256 minProfit)`;
 const EXECUTE_ARBITRAGE_ABI = `function executeArbitrage(address token,uint256 amount,${RouteTuple} route)`;
 
+// OP-stack gas oracle predeploy: estimates the L1 data fee charged on top of
+// the L2 execution fee. On Base the L1 component can exceed the L2 component,
+// so ignoring it under-prices execution costs on thin margins.
+const OP_GAS_ORACLE_ADDRESS = "0x420000000000000000000000000000000000000F";
+const OP_GAS_ORACLE_ABI = ["function getL1Fee(bytes data) view returns (uint256)"];
+
 // Pre-flight simulation: if PREFLIGHT_SIMULATION is not "false", run an
 // eth_call (static simulation via ethers.call awaiting the revert reason)
 // and skip when it reverts instead of spending gas on a known-bad route.
@@ -782,7 +788,7 @@ async function buildOpportunity(
             // Never demand the full quoted profit on-chain: a small adverse price
             // move between quote and execution would revert InsufficientProfit.
             // Keep a MIN_PROFIT_BUFFER_PCT% floor of the quoted profit instead.
-            minProfit: (profit * (100n - BigInt(MIN_PROFIT_BUFFER_PCT))) / 100n
+            minProfit: (profit * BigInt(MIN_PROFIT_BUFFER_PCT)) / 100n
         },
         inputAmount: amountIn,
         outputAmount: amountIn + profit,
@@ -796,20 +802,49 @@ async function buildOpportunity(
  * simulation between detection and execution, so a detected spread is not
  * lost while gas is estimated. Flat gas limit × current gas price × WETH
  * price (cached); the executor re-estimates gas precisely when sending.
+ *
+ * Base is an OP-stack L2: total cost = L2 execution fee + L1 data fee. The
+ * L1 component comes from the OP GasPriceOracle predeploy (getL1Fee on the
+ * RLP-encoded transaction); when the oracle is unavailable we scale the L2
+ * estimate by 25% so thin-margin trades are not priced gas-free.
+ *
+ * Fail-closed: when gas cannot be priced at all, return -Infinity so the
+ * trade is skipped instead of executed with an unknown gas cost (the previous
+ * fail-open treated the gas price lookup failing as "gas is free").
  */
-async function netProfitAfterGasUSD(opp: any, token: string): Promise<number> {
+async function netProfitAfterGasUSD(
+    opp: any,
+    token: string,
+    engineContract?: Contract | null
+): Promise<number> {
     const base = opp?.netProfitUSD || 0;
-    try {
-        const feeData = await provider.getFeeData();
-        const gasPrice = feeData?.maxFeePerGas ?? feeData?.gasPrice ?? 0n;
-        if (gasPrice <= 0n) return base;
-        const gasLimit = 600000n; // typical flash-loan arbitrage gas
-        const ethPrice = await tokenUsdPrice(TOKENS.WETH);
-        const gasUSD = Number(formatUnits(gasPrice * gasLimit, 18)) * ethPrice;
-        return Math.max(0, base - gasUSD);
-    } catch {
-        return base;
+    const feeData = await provider.getFeeData();
+    const gasPrice = feeData?.maxFeePerGas ?? feeData?.gasPrice;
+    if (gasPrice === null || gasPrice === undefined || gasPrice <= 0n) {
+        return -Infinity; // cannot price gas — do not execute blind
     }
+    const gasLimit = 600000n; // typical flash-loan arbitrage gas (slightly over-estimates 2-swap routes)
+    const ethPrice = await tokenUsdPrice(TOKENS.WETH);
+
+    const l2FeeWei = gasPrice * gasLimit;
+    let l1FeeWei = 0n;
+    if (engineContract) {
+        try {
+            const txData = engineContract.interface.encodeFunctionData(
+                "executeArbitrage",
+                [token, opp.inputAmount, opp.route]
+            );
+            const oracle = new Contract(OP_GAS_ORACLE_ADDRESS, OP_GAS_ORACLE_ABI, provider);
+            l1FeeWei = await oracle.getL1Fee(txData);
+        } catch {
+            l1FeeWei = 0n;
+        }
+    }
+    // When the oracle is unreachable, assume the L1 data fee is ~25% of the L2
+    // fee rather than pretending it does not exist.
+    const totalFeeWei = l1FeeWei > 0n ? l2FeeWei + l1FeeWei : l2FeeWei + l2FeeWei / 4n;
+    const gasUSD = Number(formatUnits(totalFeeWei, 18)) * ethPrice;
+    return base - gasUSD;
 }
 
 // ------------------------------------------------------------------
@@ -839,9 +874,11 @@ async function main() {
     // Execution cooldown: after a failed execution attempt, block re-execution
     // of the same route (token pair + DEX combo) for EXECUTION_COOLDOWN_MS so a
     // persistent-but-unexecutable spread cannot burn gas on repeated reverts.
+    // tokenB is part of the key: in all/list mode pairs sharing tokenA and the
+    // same DEX combo (e.g. WETH/USDC vs WETH/AERO) must not block each other.
     const lastExecutionFailAt = new Map<string, number>();
-    const routeKey = (tokenA: string, forwardDex: string, reverseDex: string): string =>
-        `${tokenA.toLowerCase()}|${forwardDex}|${reverseDex}`;
+    const routeKey = (tokenA: string, tokenB: string, forwardDex: string, reverseDex: string): string =>
+        `${tokenA.toLowerCase()}|${tokenB.toLowerCase()}|${forwardDex}|${reverseDex}`;
     const inExecutionCooldown = (key: string): boolean => {
         const failedAt = lastExecutionFailAt.get(key);
         return failedAt !== undefined && Date.now() - failedAt < EXECUTION_COOLDOWN_MS;
@@ -947,6 +984,7 @@ async function main() {
 
     // Amount for monitoring (in token A units) — kept for single mode
     let amountInSingle: bigint | undefined;
+    let lastSingleTestSizeUSD = -1;
 
     // Preload pool cache from subgraphs (lightweight GraphQL; avoids RPC rate limits) — enables MIN_DEX_VARIETY/MIN_LIQUIDITY filters.
     const SUBGRAPH_POOL_LIMIT_N = Number(process.env.SUBGRAPH_POOL_LIMIT || 20);
@@ -1179,7 +1217,7 @@ async function main() {
                 continue;
             }
 
-            const cooldownKey = routeKey(tokenA, forward.dex, reverse.dex);
+            const cooldownKey = routeKey(tokenA, forward.tokenOut, forward.dex, reverse.dex);
             if (inExecutionCooldown(cooldownKey)) {
                 console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping execution`);
                 await waitForNextScan();
@@ -1195,7 +1233,7 @@ async function main() {
                 continue;
             }
 
-            const netAfterGas = await netProfitAfterGasUSD(opp, tokenA);
+            const netAfterGas = await netProfitAfterGasUSD(opp, tokenA, engineContract);
             if (netAfterGas < MIN_NET_PROFIT_USD) {
                 console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
                 await waitForNextScan();
@@ -1243,13 +1281,18 @@ async function main() {
         }
 
         // -------- Single-pair mode (default) --------
-        // Safety net: single mode computes the test amount at startup, but
-        // recompute lazily so the loop can never read an unassigned value.
-        // If the USD price is temporarily unavailable, skip this loop instead
-        // of crashing the watcher.
-        if (amountInSingle === undefined) {
+        // Recompute the monitoring amount whenever the test-size ladder advances:
+        // caching amountInSingle forever made the ladder a no-op in single mode.
+        // Cap the raw amount at MAX_LOAN_USD (per usdToTokenAmount comment) so a
+        // large quoted profit cannot drag the executed loan past the limit. If
+        // the USD price is temporarily unavailable, skip this loop instead of
+        // crashing the watcher.
+        if (lastSingleTestSizeUSD !== currentTestAmountUSD || amountInSingle === undefined) {
             try {
-                amountInSingle = await usdToTokenAmount(currentTestAmountUSD, WATCH_PAIR_A);
+                const rawAmount = await usdToTokenAmount(currentTestAmountUSD, WATCH_PAIR_A);
+                const maxLoanRaw = await usdToTokenAmount(MAX_LOAN_USD, WATCH_PAIR_A);
+                amountInSingle = rawAmount <= maxLoanRaw ? rawAmount : maxLoanRaw;
+                lastSingleTestSizeUSD = currentTestAmountUSD;
             } catch (e: any) {
                 console.log(`  ⚠️ Cannot size amount for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}) — skipping loop`);
                 await waitForNextScan();
@@ -1381,7 +1424,7 @@ async function main() {
             continue;
         }
 
-        const cooldownKey = routeKey(WATCH_PAIR_A, forward.dex, reverse.dex);
+        const cooldownKey = routeKey(WATCH_PAIR_A, WATCH_PAIR_B, forward.dex, reverse.dex);
         if (inExecutionCooldown(cooldownKey)) {
             console.log(`  ⏳ Route ${forward.dex}→${reverse.dex} in cooldown after a recent failure — skipping execution`);
             await waitForNextScan();
@@ -1399,7 +1442,7 @@ async function main() {
             continue;
         }
 
-        const netAfterGas = await netProfitAfterGasUSD(opp, WATCH_PAIR_A);
+        const netAfterGas = await netProfitAfterGasUSD(opp, WATCH_PAIR_A, engineContract);
         if (netAfterGas < MIN_NET_PROFIT_USD) {
             console.log(`  Net after gas $${netAfterGas.toFixed(2)} < $${MIN_NET_PROFIT_USD}, skipping`);
             await waitForNextScan();
