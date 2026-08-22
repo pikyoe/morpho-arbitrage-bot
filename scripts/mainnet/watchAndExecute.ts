@@ -287,31 +287,37 @@ function structuredLog(level: "info" | "warn" | "error", msg: string, extra?: Re
 }
 
 // C1: Re-quote forward+reverse legs right before execution to verify the
-// spread is still live. Returns fresh spread % and forward quote, or null
-// if the spread collapsed or re-quote failed.
+// spread is still live. Returns fresh spread %, forward and reverse quotes,
+// and the recomputed profit, or null if the spread collapsed or the re-quote
+// failed. 1inch legs are re-quoted via quoteOneInch (they are not in
+// dexProviders); DEX legs are re-quoted on the matching provider.
 async function freshSpreadCheck(
     forward: QuoteResult,
     reverse: QuoteResult,
     amountIn: bigint,
     dexProviders: DexQuoteProvider[]
-): Promise<{ spreadPct: number; forward: QuoteResult } | null> {
+): Promise<{ spreadPct: number; forward: QuoteResult; reverse: QuoteResult; profit: bigint } | null> {
     const startMs = Date.now();
+    const reQuote = async (dex: string, tokenIn: string, tokenOut: string, amt: bigint): Promise<QuoteResult | null> => {
+        if (dex === "1INCH") {
+            return quoteOneInch({ tokenIn, tokenOut, amountIn: amt });
+        }
+        const matched = dexProviders.find(d => d.getDexName() === dex);
+        if (!matched) return null;
+        return quoteOn(matched, tokenIn, tokenOut, amt);
+    };
     try {
-        const matchedDex = dexProviders.find(d => d.getDexName() === forward.dex);
-        if (!matchedDex) return null;
-        const freshForward = await quoteOn(matchedDex, forward.tokenIn, forward.tokenOut, amountIn);
+        const freshForward = await reQuote(forward.dex, forward.tokenIn, forward.tokenOut, amountIn);
         if (!freshForward || freshForward.amountOut <= 0n) return null;
 
-        const matchedSellDex = dexProviders.find(d => d.getDexName() === reverse.dex);
-        if (!matchedSellDex) return null;
-        const freshReverse = await quoteOn(matchedSellDex, forward.tokenOut, forward.tokenIn, freshForward.amountOut);
+        const freshReverse = await reQuote(reverse.dex, forward.tokenOut, forward.tokenIn, freshForward.amountOut);
         if (!freshReverse || freshReverse.amountOut <= 0n) return null;
 
         const freshProfit = freshReverse.amountOut - amountIn;
         if (freshProfit <= 0n) return null;
         const freshSpreadPct = Number((freshProfit * 1_000_000n) / amountIn) / 10_000;
         console.log(`  [fresh-gate] spread ${(Number((forward.amountOut - amountIn) * 1_000_000n / amountIn) / 10_000).toFixed(3)}% → ${freshSpreadPct.toFixed(3)}% (${Date.now() - startMs}ms)`);
-        return { spreadPct: freshSpreadPct, forward: freshForward };
+        return { spreadPct: freshSpreadPct, forward: freshForward, reverse: freshReverse, profit: freshProfit };
     } catch {
         return null;
     }
@@ -884,16 +890,20 @@ async function buildOpportunity(
 
 // M4: Dynamic gas limit estimation based on route complexity.
 function estimateGasLimit(route: any): bigint {
-    const steps = route?.swaps?.length ?? 2;
     const baseGas = 200_000n; // flash loan callback + overhead
-    let perStepGas = 150_000n; // standard DEX swap
+    const perStepGas = 150_000n; // standard DEX swap
     const inchAdapter = process.env.INCH_ADAPTER_V2_ADDRESS?.toLowerCase();
-    for (const swap of route?.swaps ?? []) {
+    const swaps = route?.swaps ?? [];
+    // No route info: assume a 2-swap round trip.
+    if (swaps.length === 0) return baseGas + perStepGas * 2n;
+    let total = baseGas;
+    for (const swap of swaps) {
+        total += perStepGas; // standard DEX swap
         if (inchAdapter && swap?.adapter?.toLowerCase() === inchAdapter) {
-            perStepGas += 100_000n; // 1inch aggregator is heavier
+            total += 100_000n; // 1inch aggregator is heavier (per 1inch leg only)
         }
     }
-    return baseGas + perStepGas * BigInt(steps);
+    return total;
 }
 
 /**
@@ -1326,6 +1336,8 @@ async function main() {
 
             // C1: Fresh-quote gate
             let execForward = forward;
+            let execReverse = reverse;
+            let execProfit = profit;
             if (FRESH_QUOTE_GATE) {
                 const freshCheck = await freshSpreadCheck(forward, reverse, amountIn, dexProviders);
                 if (!freshCheck || freshCheck.spreadPct < spreadThresholdFor(forward, reverse)) {
@@ -1334,11 +1346,13 @@ async function main() {
                     continue;
                 }
                 execForward = freshCheck.forward;
+                execReverse = freshCheck.reverse;
+                execProfit = freshCheck.profit;
             }
 
             let opp: any;
             try {
-                opp = await buildOpportunity(execForward, reverse, tokenA, amountIn, profit, adapterRegistry!);
+                opp = await buildOpportunity(execForward, execReverse, tokenA, amountIn, execProfit, adapterRegistry!);
             } catch (e: any) {
                 console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
                 await waitForNextScan();
@@ -1547,6 +1561,8 @@ async function main() {
         const profit = reverse.amountOut - amountIn;
         // C1: Fresh-quote gate
         let execForward = forward;
+        let execReverse = reverse;
+        let execProfit = profit;
         if (FRESH_QUOTE_GATE) {
             const freshCheck = await freshSpreadCheck(forward, reverse, amountIn, dexProviders);
             if (!freshCheck || freshCheck.spreadPct < spreadThresholdFor(forward, reverse)) {
@@ -1555,11 +1571,13 @@ async function main() {
                 continue;
             }
             execForward = freshCheck.forward;
+            execReverse = freshCheck.reverse;
+            execProfit = freshCheck.profit;
         }
 
         let opp: any;
         try {
-            opp = await buildOpportunity(execForward, reverse, WATCH_PAIR_A, amountIn, profit, adapterRegistry!);
+            opp = await buildOpportunity(execForward, execReverse, WATCH_PAIR_A, amountIn, execProfit, adapterRegistry!);
         } catch (e: any) {
             console.log(`  ⚠️ Could not build route (${e?.message || String(e)}) — skipping execution`);
             await waitForNextScan();
