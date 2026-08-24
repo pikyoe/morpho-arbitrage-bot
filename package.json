@@ -7,15 +7,18 @@
   "scripts": {
     "bot": "ENV_FILE=.env.mainnet tsx scripts/mainnet/watchAndExecute.ts",
     "bot:targeted": "ENV_FILE=.env.mainnet tsx scripts/mainnet/watchAndExecuteTargeted.ts",
+    "mcp": "ENV_FILE=.env.mainnet tsx bot/mcp/server.ts",
     "build": "tsc",
     "clean": "rm -rf dist",
     "compile": "hardhat compile",
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@openzeppelin/contracts": "^5.6.1",
     "dotenv": "^17.4.2",
-    "ethers": "^6.17.0"
+    "ethers": "^6.17.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-ethers": "^4.0.15",
