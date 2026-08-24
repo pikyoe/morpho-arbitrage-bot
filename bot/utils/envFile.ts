@@ -22,6 +22,27 @@ export interface EnvLoadResult {
     error?: Error;
 }
 
+/**
+ * Expand escapes in a double-quoted value in a single left-to-right pass.
+ * `\\` is consumed as a literal backslash before any single-char escape, so an
+ * escaped sequence like `\\n` (backslash + n) stays literal instead of becoming
+ * a newline. Recognized escapes: \n \r \t \\; any other `\x` stays as-is.
+ */
+function unescapeDoubleQuoted(value: string): string {
+    let out = "";
+    for (let i = 0; i < value.length; i++) {
+        const c = value[i];
+        if (c !== "\\" || i === value.length - 1) { out += c; continue; }
+        const next = value[++i];
+        if (next === "n") out += "\n";
+        else if (next === "r") out += "\r";
+        else if (next === "t") out += "\t";
+        else if (next === "\\") out += "\\";
+        else out += "\\" + next; // unknown escape: keep both chars
+    }
+    return out;
+}
+
 /** Parse .env content into a key/value map (pure, no side effects). */
 export function parseEnv(src: string): Record<string, string> {
     const out: Record<string, string> = {};
@@ -46,11 +67,7 @@ export function parseEnv(src: string): Record<string, string> {
             const end = value.indexOf(quote, 1);
             value = end === -1 ? value.slice(1) : value.slice(1, end);
             if (quote === '"') {
-                value = value
-                    .replace(/\\n/g, "\n")
-                    .replace(/\\r/g, "\r")
-                    .replace(/\\t/g, "\t")
-                    .replace(/\\\\/g, "\\");
+                value = unescapeDoubleQuoted(value);
             }
         } else {
             // Strip an optional inline comment preceded by whitespace.
