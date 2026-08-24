@@ -204,8 +204,8 @@ const provider = rpcProviders.length > 1
     : rpcProviders[0];
 
 // WebSocket is reserved for block-driven scan triggers; all HTTP reads,
-// quotes, gas estimation and execution use the fallback RPC set (same split
-// as runBot.ts). Without BASE_WS_RPC_URL the loop falls back to the poll timer.
+// quotes, gas estimation and execution use the fallback RPC set.
+// Without BASE_WS_RPC_URL the loop falls back to the poll timer.
 const wsProvider: WebSocketProvider | null = process.env.BASE_WS_RPC_URL
     ? new WebSocketProvider(process.env.BASE_WS_RPC_URL)
     : null;

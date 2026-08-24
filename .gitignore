@@ -27,6 +27,10 @@ dist/
 
 # Local tooling / agent config
 .claude/
+.continue/
+
+# Runtime execution artifacts
+executions/
 # OS files
 .DS_Store
 Thumbs.db

@@ -6,7 +6,7 @@ export interface GasConfig {
     gasLimit?: bigint;
 }
 
-/** Result returned by executeFlashLoan for convenient callers (watchAndExecute, runBot). */
+/** Result returned by executeFlashLoan for convenient callers (watchAndExecute). */
 export interface FlashLoanResult {
     success: boolean;
     txHash?: string;

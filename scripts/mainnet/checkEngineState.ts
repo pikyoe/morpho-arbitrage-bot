@@ -22,6 +22,9 @@ const ENGINE_ADDRESS = process.env.ARBITRAGE_ENGINE_V2_ADDRESS;
 if (!RPC_URL) throw new Error("BASE_RPC_URL not set");
 if (!ENGINE_ADDRESS) throw new Error("ARBITRAGE_ENGINE_V2_ADDRESS not set");
 
+// Narrowed copy: TS narrowing does not propagate into the main() closure.
+const engineAddress: string = ENGINE_ADDRESS;
+
 const ENGINE_ABI = [
     "function owner() view returns (address)",
     "function paused() view returns (bool)",
@@ -36,7 +39,7 @@ const ENGINE_ABI = [
 
 async function main() {
     const provider = new JsonRpcProvider(RPC_URL);
-    const engine = new Contract(ENGINE_ADDRESS, ENGINE_ABI, provider);
+    const engine = new Contract(engineAddress, ENGINE_ABI, provider);
 
     const network = await provider.getNetwork();
     console.log("====================================");

@@ -117,14 +117,8 @@ export class ConfigValidator {
 
         // Validate private key
         const privateKey = process.env.PRIVATE_KEY;
-        if (privateKey) {
-            if (!this.isValidPrivateKey(privateKey)) {
-                errors.push('Invalid private key format');
-            }
-            // Warn if private key looks like a real key (security check)
-            if (privateKey.length > 20 && !privateKey.includes('...')) {
-                warnings.push('⚠️ SECURITY WARNING: Private key appears to be exposed. Ensure .env file is not committed to git.');
-            }
+        if (privateKey && !this.isValidPrivateKey(privateKey)) {
+            errors.push('Invalid private key format');
         }
 
         // Check for reasonable gas price configuration

@@ -1,66 +1,43 @@
 # Morpho Arbitrage Bot
 
-## Ringkasan
+Bot arbitrage berbasis Morpho flash loans dengan adapter DEX V2 untuk Base mainnet.
+Bot utama: `scripts/mainnet/watchAndExecute.ts`.
 
-Proyek ini adalah bot arbitrage berbasis Morpho flash loans dengan adapter DEX V2 yang dilengkapi dengan safety features untuk production deployment di Base mainnet.
+## Struktur
 
-## ✨ Fitur Baru (Production-Ready)
+- `contracts/v2/` — kontrak aktif:
+  - `core/ArbitrageEngineV2.sol` — engine eksekusi route (flash-loan receiver)
+  - `core/MorphoFlashLoanV2.sol` — wrapper flash loan Morpho
+  - `adapters/` — UniswapV3, Aerodrome, PancakeSwapV3, 1inch
+- `bot/` — modul TypeScript yang dipakai watcher (scanner, quote providers, executor)
+- `scripts/mainnet/` — deploy, wiring, diagnostik, dan bot utama
+- `scripts/v2/` — deploy & uji di Base Sepolia
+- `scripts/utils/` — util deploy/monitoring/config
 
-### 🔒 Keamanan & Safety
-- **Circuit Breaker**: Otomatis stop operasi setelah 3 consecutive failures
-- **Configuration Validation**: Validasi environment variables sebelum startup
-- **Rate Limiting**: Maksimal 10 transaksi per menit
-- **Gas Price Protection**: Block eksekusi jika gas > 50 gwei
-- **Balance Check**: Minimum balance requirement sebelum eksekusi
+## Fitur keamanan & risk management
 
-### 💹 Risk Management
-- **Opportunity Filter**: Filter berdasarkan:
-  - Minimum net profit: $5
-  - Maximum gas ratio: 50%
-  - Minimum ROI: 1%
-  - Minimum loan size: $100
-- **Deduplication**: Hindari processing opportunity yang sama
-- **Position Sizing**: Optimal size calculation
+### On-chain (kontrak)
+- Access control: `onlyOwner` / `onlyEngine` / `onlyMorpho` / `onlyFlashLoan`
+- Pausable di engine dan wrapper
+- Validasi route: closed cycle, hanya adapter yang di-approve, `minAmountOut` per leg
+- Floor `minProfit` on-chain; revert `InsufficientProfit` jika tidak tercapai
+- Guard `InProgress` mencegah flash loan tumpang tindih
+- Fungsi `rescueToken`/`rescueETH` terbatas owner
 
-### 🛡️ MEV Protection (Flashbots)
-- **Flashbots Integration**: Protection dari front-running dan sandwich attacks
-- **Smart Routing**: Otomatis pilih antara Flashbots vs public mempool
-- **Profit Threshold**: Gunakan Flashbots hanya untuk profitable transactions
-- **Fallback Mechanism**: Otomatis fallback ke public mempool jika Flashbots gagal
-- **Dynamic Configuration**: Adjustable thresholds dan retry logic
-
-### ⚡ Performance
-- **Dynamic Gas Management**: EIP-1559 support dengan automatic gas adjustment
-- **Error Classification**: Smart retry logic berdasarkan error type
-- **Exponential Backoff**: Automatic retry dengan delay yang meningkat
-- **Gas Estimation**: Dynamic gas limit calculation
-
-### 🛠️ Reliability
-- **Error Handling**: Comprehensive error classification dan recovery
-- **Graceful Shutdown**: Proper cleanup pada SIGINT/SIGTERM
-- **Logging**: Structured logging untuk monitoring
-- **State Tracking**: Opportunity repository dengan TTL
-
-### Struktur aktif vs legacy
-
-- Implementasi aktif saat ini berada di folder [contracts/v2](contracts/v2) dan script deployment/testing di [scripts/v2](scripts/v2) serta [scripts/mainnet](scripts/mainnet).
-- File lama di root [contracts](contracts) dan [contracts/adapters](contracts/adapters) masih ada sebagai referensi legacy/v1 dan tidak digunakan oleh alur V2 yang sekarang.
-- Beberapa file memiliki nama yang sama di folder berbeda (misalnya adapter V2 di [contracts/adapters/UniswapV3AdapterV2.sol](contracts/adapters/UniswapV3AdapterV2.sol) dan [contracts/v2/adapters/UniswapV3AdapterV2.sol](contracts/v2/adapters/UniswapV3AdapterV2.sol)); untuk deployment dan debugging, gunakan yang ada di folder [contracts/v2](contracts/v2).
-
-- Kontrak utama V2:
-  - `ArbitrageEngineV2`
-  - `MorphoFlashLoanV2`
-  - `UniswapV3AdapterV2`
-  - `AerodromeAdapterV2`
-- Folder skrip deploy:
-  - `scripts/v2/` untuk uji Sepolia
-  - `scripts/mainnet/` untuk deploy mainnet
+### Off-chain (watcher)
+- **Fail-closed execution**: transaksi hanya jika `WATCH_ENABLE_EXECUTION=true`
+- **Preflight simulation**: `eth_call` penuh sebelum kirim transaksi
+- **Fresh-quote gate**: re-quote tepat sebelum eksekusi untuk memastikan spread masih hidup
+- **Execution cooldown**: route yang gagal diblokir sementara agar tidak membakar gas berulang
+- **Gas pricing**: estimasi L2 + L1 data fee via OP GasPriceOracle; skip jika gas tidak bisa dihargai
+- **Quote outlier filter**: membuang quote stale/dust
+- Validasi chain ID 8453 saat startup
 
 ## Environment
 
-Gunakan file `.env.mainnet` untuk deployment mainnet.
+Gunakan file `.env.mainnet` untuk mainnet (lihat `.env.example`).
 
-Contoh variabel penting:
+Variabel penting:
 
 ```dotenv
 PRIVATE_KEY=0x...
@@ -79,17 +56,11 @@ UNISWAP_ADAPTER_V2_ADDRESS=0x...
 AERODROME_ADAPTER_V2_ADDRESS=0x...
 ```
 
-Opsional:
-
-```dotenv
-SAMPLE_AUTHORIZED_ADDRESS=0x...
-```
-
 ## Compile dan test
 
 ```bash
-npx hardhat compile
-npx hardhat test
+npm run compile
+npm test
 ```
 
 ## Deploy & wiring mainnet
@@ -104,11 +75,6 @@ npx hardhat run scripts/mainnet/deployMorphoFlashLoanV2.ts --network base
 
 ```bash
 npx hardhat run scripts/mainnet/deployUniswapAdapterV2.ts --network base
-```
-
-atau untuk Aerodrome:
-
-```bash
 npx hardhat run scripts/mainnet/deployAerodromeAdapterV2.ts --network base
 ```
 
@@ -138,93 +104,53 @@ npx hardhat run scripts/mainnet/checkWiringV2.ts --network base
 
 ## Uji Sepolia
 
-Gunakan skrip di `scripts/v2/` untuk deploy dan uji di Sepolia.
-
-Contoh:
+Gunakan skrip di `scripts/v2/` untuk deploy dan uji di Base Sepolia:
 
 ```bash
 npx hardhat run scripts/v2/deployMorphoFlashLoanV2.ts --network baseSepolia
 npx hardhat run scripts/v2/deployUniswapV3AdapterV2.ts --network baseSepolia
 npx hardhat run scripts/v2/deployArbitrageEngineV2.ts --network baseSepolia
-npx hardhat run scripts/v2/setMorphoEngineV2.ts --network baseSepolia
-npx hardhat run scripts/v2/setAdapterEngineV2.ts --network baseSepolia
 npx hardhat run scripts/v2/checkWiringV2.ts --network baseSepolia
 ```
 
-## Catatan penting
-
-- `ARBITRAGE_ENGINE=` di `.env.mainnet` tidak digunakan oleh skrip V2.
-- Pastikan variabel environment yang dibutuhkan sudah terisi sebelum menjalankan skrip deploy atau wiring.
-- Jika kamu ingin deploy ke mainnet, selalu gunakan `--network base` atau pastikan skrip mainnet menggunakan network yang benar.
-
-## 🚀 Menjalankan Bot di Mainnet
+## Menjalankan bot
 
 ### Prerequisites
-1. Pastikan semua kontrak sudah di-deploy dan wired dengan benar
-2. Environment variables sudah terkonfigurasi di `.env.mainnet`
+1. Semua kontrak sudah di-deploy dan wired dengan benar
+2. Environment variables terkonfigurasi di `.env.mainnet`
 3. Wallet memiliki cukup ETH untuk gas (minimal 0.1 ETH disarankan)
 
-### Starting the Bot
+### Start
 
 ```bash
-# Run bot dengan environment mainnet
-npx hardhat run scripts/mainnet/runBot.ts --network base
+npm run bot
+# atau langsung:
+ENV_FILE=.env.mainnet npx tsx scripts/mainnet/watchAndExecute.ts
 ```
 
-### Configuration Parameters
+Bot berjalan dalam mode watch-only secara default. Set `WATCH_ENABLE_EXECUTION=true`
+di `.env.mainnet` untuk mengaktifkan eksekusi transaksi.
 
-Di dalam `runBot.ts`, ada beberapa parameter yang bisa disesuaikan:
+### Parameter konfigurasi utama (env)
 
-**Opportunity Filter Config:**
-```typescript
-const filterConfig: FilterConfig = {
-    minNetProfitUSD: 5.0,           // Minimum $5 profit
-    maxGasRatio: 0.5,               // Gas max 50% of gross profit
-    minROI: 0.01,                   // Minimum 1% ROI
-    minLoanUSD: 100.0               // Minimum $100 loan size
-};
-```
+- `WATCH_MODE`: `single` | `all` | `list`
+- `WATCH_PAIRS`: daftar pair untuk mode `list` (`"0xAAA,0xBBB;0xCCC,0xDDD"`)
+- `SPREAD_THRESHOLD_PCT`: spread minimum (default 0.2%)
+- `MIN_NET_PROFIT_USD`: profit bersih minimum setelah gas (default $1)
+- `SLIPPAGE_PCT`: toleransi slippage per leg (default 0.5%, clamp 0.05–3%)
+- `MIN_PROFIT_BUFFER_PCT`: persen profit kuotasi yang dijadikan floor on-chain (default 50)
+- `WATCH_MAX_LOAN_USD`: batas ukuran loan per trade (default $10.000)
+- `EXECUTION_COOLDOWN_MS`: cooldown route setelah gagal (default 60.000)
 
-**Circuit Breaker Config:**
-```typescript
-const circuitBreakerConfig: CircuitBreakerConfig = {
-    maxConsecutiveFailures: 3,           // Open after 3 consecutive failures
-    cooldownPeriod: 300_000,             // 5 minutes cooldown
-    maxGasPriceGwei: 50,                 // Block if gas > 50 gwei
-    maxTxsPerMinute: 10,                // Rate limit: 10 tx/min
-    minBalanceETH: 0.1                   // Minimum 0.1 ETH balance
-};
-```
+## Monitoring
 
-**Flashbots MEV Protection Config:**
-```typescript
-const flashbotsConfig: FlashbotsConfig = {
-    enabled: true,                       // Enable/disable Flashbots
-    relayUrl: 'https://relay.flashbots.net',
-    minProfitThreshold: 10.0,           // Minimum $10 profit to use Flashbots
-    maxRetries: 3,                       // Max retries for Flashbots
-    fallbackToPublic: true               // Fallback to public mempool on failure
-};
-```
+Bot mencetak:
+- Scan results dan spread yang terdeteksi
+- Latency per tahap (quote, build route, preflight, eksekusi)
+- Status eksekusi dan profit terverifikasi on-chain (event `ArbitrageFinished`)
+- Ringkasan statistik saat shutdown (SIGINT/SIGTERM)
 
-## 🔍 Monitoring
-
-### Logs Output
-Bot akan mencetak:
-- Scan results dan opportunity details
-- Circuit breaker status
-- Gas prices dan transaction costs
-- Error classification dan retry attempts
-- Execution summary
-
-### Circuit Breaker Status
-Circuit breaker otomatis:
-- Membuka setelah 3 consecutive failures
-- Menutup setelah cooldown period (5 menit)
-- Melakukan rate limiting (max 10 tx/menit)
-- Block eksekusi jika gas price terlalu tinggi
-
-## ⚠️ Security Reminders
+## Security reminders
 
 1. **NEVER commit `.env` files** ke git
 2. **Use separate wallets** untuk testing dan mainnet
@@ -233,64 +159,18 @@ Circuit breaker otomatis:
 5. **Keep small amounts** di wallet yang digunakan bot
 6. **Use hardware wallets** untuk menyimpan dana besar
 
-## 🛡️ MEV Protection dengan Flashbots
-
-### Overview
-Bot ini dilengkapi dengan **Flashbots integration** untuk melindungi dari MEV (Maximal Extractable Value) attacks seperti front-running dan sandwich attacks.
-
-### Cara Kerja
-1. **Smart Routing**: Bot otomatis memilih antara Flashbots atau public mempool
-2. **Profit Threshold**: Flashbots hanya digunakan untuk transactions dengan profit > $10
-3. **Protection**: Private mempool melindungi dari MEV bots
-4. **Fallback**: Otomatis fallback ke public mempool jika Flashbots gagal
-
-### Configuration
-Di `.env.mainnet` atau `.env.sepolia`:
-
-```bash
-# Enable/disable Flashbots
-FLASHBOTS_ENABLED=true
-
-# Flashbots relay URL (default: https://relay.flashbots.net)
-FLASHBOTS_RELAY_URL=https://relay.flashbots.net
-
-# Minimum profit USD untuk menggunakan Flashbots
-FLASHBOTS_MIN_PROFIT_USD=10.0
-
-# Maximum retries untuk Flashbots
-FLASHBOTS_MAX_RETRIES=3
-
-# Fallback ke public mempool jika Flashbots gagal
-FLASHBOTS_FALLBACK_TO_PUBLIC=true
-```
-
-### Keuntungan Flashbots
-- ✅ **Free to use** - Hanya optional tips
-- ✅ **High protection** - 80-90% protection dari MEV attacks
-- ✅ **Low complexity** - Mudah diimplementasikan
-- ✅ **Widely adopted** - Battle-tested di production
-
-### Upgrade Path
-Setelah profit stabil, bisa upgrade ke:
-- **Private mempool** (Alchemy, Infura Pro) - $50-200/month
-- **Custom MEV protection** - Advanced strategies
-- **Hybrid approach** - Kombinasi berbagai methods
-
-## 🛠️ Troubleshooting
+## Troubleshooting
 
 ### Bot tidak start
-- Cek configuration validation: `ConfigValidator.validateOrThrow()`
-- Pastikan semua environment variables terisi
+- Pastikan semua environment variables terisi (lihat `.env.example`)
 - Verifikasi RPC URL connectivity
 
 ### Transaksi gagal terus
-- Cek circuit breaker status
+- Cek log preflight simulation (revert reason di-decode dari custom errors engine)
 - Verifikasi wallet balance
-- Pastikan gas price reasonable
-- Cek jika kontrak masih paused
+- Route yang gagal otomatis masuk cooldown; cek `EXECUTION_COOLDOWN_MS`
 
 ### Opportunity tidak ditemukan
-- Verifikasi factory addresses
-- Cek pool liquidity
-- Adjust filter parameters
-- Pastikan price oracle berfungsi
+- Verifikasi factory/quoter addresses
+- Cek pool liquidity (`MIN_LIQUIDITY_USD`)
+- Adjust `SPREAD_THRESHOLD_PCT` / `MIN_NET_PROFIT_USD`

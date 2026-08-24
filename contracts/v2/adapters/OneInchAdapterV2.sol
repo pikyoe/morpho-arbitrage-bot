@@ -106,6 +106,10 @@ contract OneInchAdapterV2 is
                 step.amountIn
             );
 
+        // Measure output as a balance delta so dust left from a previous trade
+        // cannot inflate amountOut and bypass the minAmountOut check.
+        uint256 balanceBefore = IERC20(step.tokenOut).balanceOf(address(this));
+
         // Execute the 1inch calldata. It encodes src/dst/amount/from=this/
         // receiver=this and carries its own embedded deadline + minReturn; the
         // engine additionally enforces step.minAmountOut below.
@@ -119,7 +123,7 @@ contract OneInchAdapterV2 is
         IERC20(step.tokenIn)
             .forceApprove(router, 0);
 
-        amountOut = IERC20(step.tokenOut).balanceOf(address(this));
+        amountOut = IERC20(step.tokenOut).balanceOf(address(this)) - balanceBefore;
         if (amountOut < step.minAmountOut) {
             revert Errors.AdapterOutputZero();
         }

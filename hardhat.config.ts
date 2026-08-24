@@ -53,7 +53,9 @@ export default defineConfig({
   base: {
     type: "http",
     chainType: "op",
-    url: process.env.BASE_RPC_URL || "",
+    // Public fallback keeps `hardhat compile`/`test` working without an env
+    // file; deployment scripts always set BASE_RPC_URL explicitly.
+    url: process.env.BASE_RPC_URL || "https://mainnet.base.org",
     accounts: process.env.PRIVATE_KEY
       ? [process.env.PRIVATE_KEY]
       : [],
@@ -63,7 +65,7 @@ export default defineConfig({
   baseSepolia: {
     type: "http",
     chainType: "op",
-    url: process.env.BASE_SEPOLIA_RPC_URL || "",
+    url: process.env.BASE_SEPOLIA_RPC_URL || "https://sepolia.base.org",
     accounts: process.env.PRIVATE_KEY
       ? [process.env.PRIVATE_KEY]
       : [],
