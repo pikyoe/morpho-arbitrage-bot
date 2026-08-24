@@ -10,7 +10,6 @@
  * Run: npm run mcp
  */
 
-import * as dotenv from "dotenv";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -35,15 +34,16 @@ import { QuoteRequest, QuoteResult } from "../scanner/quote/index.js";
 import { TOKEN_DECIMALS, TOKENS, tokenSymbol } from "../scanner/TokenList.js";
 import { getTrendingBaseTokens } from "../scanner/DexScreenerClient.js";
 import { estimateGasLimit as estimateGasLimitPure } from "../strategy/arbMath.js";
+import { loadEnvFile } from "../utils/envFile.js";
 
 // ------------------------------------------------------------------
 // Config
 // ------------------------------------------------------------------
 
-// MCP speaks JSON-RPC over stdio, so stdout must stay clean. dotenv v17 prints
-// a third-party promo line to stdout on load — silence it or the protocol breaks.
-const dotenvOptions = { path: process.env.ENV_FILE ?? ".env.mainnet", quiet: true };
-dotenv.config(dotenvOptions);
+// MCP speaks JSON-RPC over stdio, so stdout must stay clean. The local
+// loadEnvFile has no advertising/telemetry output (unlike dotenv v17), so the
+// protocol channel is never polluted.
+loadEnvFile(process.env.ENV_FILE ?? ".env.mainnet");
 
 const RPC_URLS = [...new Set([
     process.env.BASE_RPC_URL_1 || process.env.BASE_RPC_URL || process.env.RPC_URL,
@@ -143,6 +143,9 @@ async function getDecimals(address: string): Promise<number> {
         decimalsCache.set(key, dec);
         return dec;
     } catch {
+        // Cache the fallback too, so a token without a standard decimals()
+        // is only probed once instead of on every scan.
+        decimalsCache.set(key, 18);
         return 18;
     }
 }
@@ -158,6 +161,8 @@ async function getSymbol(address: string): Promise<string> {
         symbolCache.set(key, sym);
         return sym;
     } catch {
+        // Cache the fallback so a non-standard symbol() is not re-probed.
+        symbolCache.set(key, known);
         return known;
     }
 }

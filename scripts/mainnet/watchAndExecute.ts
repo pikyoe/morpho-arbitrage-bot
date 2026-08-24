@@ -1,4 +1,4 @@
-import * as dotenv from "dotenv";
+import { loadEnvFile } from "../../bot/utils/envFile.js";
 import {
     JsonRpcProvider,
     FallbackProvider,
@@ -74,12 +74,12 @@ const STABLE_LIKE = new Set([
 
 // Load .env.mainnet when no explicit environment file was supplied.
 if (!process.env.ENV_FILE) {
-    dotenv.config({ path: ".env.mainnet" });
+    loadEnvFile(".env.mainnet");
 }
 
 // Load explicit environment file before reading configuration constants.
 if (process.env.ENV_FILE) {
-    const result = dotenv.config({ path: process.env.ENV_FILE });
+    const result = loadEnvFile(process.env.ENV_FILE);
     if (result.error) {
         console.log(`⚠️ Failed to load env file ${process.env.ENV_FILE}: ${result.error.message}`);
     } else {

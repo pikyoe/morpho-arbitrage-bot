@@ -1,4 +1,3 @@
-import "dotenv/config";
 
 import getConnection from "../utils/getConnection.js";
 

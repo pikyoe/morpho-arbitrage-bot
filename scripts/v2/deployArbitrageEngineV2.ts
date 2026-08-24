@@ -1,5 +1,4 @@
 import { network } from "hardhat";
-import "dotenv/config";
 import { ensureChain } from "../utils/validateNetwork.js";
 
 

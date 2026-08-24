@@ -101,13 +101,22 @@ export async function getTrendingBaseTokens(limit = 30): Promise<TrendingToken[]
         else if (quote) push(quote, "profiles");
     }
 
+    // Cap candidates before hydration: the free DexScreener API rate-limits,
+    // so firing one getTokenPairs per address for dozens of candidates triggers
+    // transient 429s that silently drop tokens. A small multiple of `limit`
+    // keeps enough headroom after the empties are filtered out.
+    const candidates = addresses.slice(0, Math.max(limit * 2, 10));
+
     // Hydrate each candidate with its pair stats (liquidity/volume).
     const tokens = await Promise.all(
-        addresses.map(async ({ address, source }) => {
+        candidates.map(async ({ address, source }) => {
             const pairs = await getTokenPairs(address);
             const basePairs = pairs.filter(p => p.chainId === "base");
             if (basePairs.length === 0) return null;
 
+            // Sort by liquidity so the representative price comes from the
+            // dominant pool, not an arbitrary (possibly thin) first pair.
+            basePairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
             const liquidityUsd = basePairs.reduce((s, p) => s + (p.liquidity?.usd ?? 0), 0);
             const volume24hUsd = basePairs.reduce((s, p) => s + (p.volume?.h24 ?? 0), 0);
             const txns24h = basePairs.reduce(

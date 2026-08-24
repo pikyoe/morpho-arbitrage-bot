@@ -5,12 +5,12 @@
  * watchAndExecute.ts, but restricts it to a small fixed pair list.
  * Set WATCH_ENABLE_EXECUTION=true in the env file to allow transactions.
  */
-import * as dotenv from "dotenv";
+import { loadEnvFile } from "../../bot/utils/envFile.js";
 
 // Load the requested environment before importing the watcher. Defaults to
 // .env.mainnet so a stale root .env can never shadow the production config.
 const envPath = process.env.ENV_FILE || ".env.mainnet";
-const envResult = dotenv.config({ path: envPath });
+const envResult = loadEnvFile(envPath);
 if (envResult.error && process.env.ENV_FILE) {
     throw new Error(`Failed to load environment file ${envPath}: ${envResult.error.message}`);
 }

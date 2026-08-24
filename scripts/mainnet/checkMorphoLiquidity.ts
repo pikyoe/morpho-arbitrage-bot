@@ -13,14 +13,14 @@
  *   ENV_FILE=.env.mainnet npx tsx scripts/mainnet/checkMorphoLiquidity.ts
  */
 
-import * as dotenv from "dotenv";
+import { loadEnvFile } from "../../bot/utils/envFile.js";
 import { JsonRpcProvider, Contract, formatUnits } from "ethers";
 
 if (!process.env.ENV_FILE) {
-    dotenv.config({ path: ".env.mainnet" });
+    loadEnvFile(".env.mainnet");
 }
 if (process.env.ENV_FILE) {
-    dotenv.config({ path: process.env.ENV_FILE });
+    loadEnvFile(process.env.ENV_FILE);
 }
 
 const RPC_URL = process.env.BASE_RPC_URL || process.env.RPC_URL;
