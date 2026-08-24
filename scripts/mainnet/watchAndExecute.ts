@@ -146,11 +146,12 @@ const VERBOSE = process.env.WATCH_VERBOSE === "true";
 const FRESH_QUOTE_GATE = process.env.FRESH_QUOTE_GATE !== "false";
 // M1: Configurable USD price cache TTL (default 10s, was hardcoded 30s).
 const USD_PRICE_CACHE_TTL_MS = Math.max(5_000, Number(process.env.USD_PRICE_CACHE_TTL_MS || 10_000));
-// M6b: Gross-distortion factor for the USD price guard. The live median is only
-// clamped to the static reference when it is >this factor off (default 5x). The
-// reference table is a placeholder, so a tight band would clamp accurate live
-// prices to stale constants; a 5x factor catches only genuine thin-pool garbage.
-const MAX_USD_PRICE_DISTORTION = Math.min(Math.max(Number(process.env.MAX_USD_PRICE_DISTORTION || 5), 2), 50);
+// M6b: When independent live DEX quotes for a token disagree by more than this
+// factor (cheapest vs priciest), the sources are too distorted to price reliably
+// — fail closed instead of trusting any single value. This never clamps an
+// accurate live price to the stale static table; it only rejects internal
+// disagreement among live sources.
+const MAX_USD_PRICE_SPREAD = Math.min(Math.max(Number(process.env.MAX_USD_PRICE_SPREAD || 3), 1.5), 20);
 // C2: Slippage tolerance for 1inch reverse legs (default 2× SLIPPAGE_PCT).
 const INCH_REVERSE_SLIPPAGE_PCT = Math.min(
     Math.max(Number(process.env.INCH_REVERSE_SLIPPAGE_PCT || SLIPPAGE_PCT * 2), 0.1),
@@ -514,22 +515,21 @@ async function tokenUsdPrice(token: string): Promise<number> {
     }
     if (allPrices.length >= 2) {
         allPrices.sort((a, b) => a - b);
-        let median = allPrices[Math.floor(allPrices.length / 2)];
-        // M6b: clamp ONLY on gross (>5x) distortion, never on ordinary market
-        // moves. The static reference table (TOKEN_PRICES_USD) is a placeholder
-        // ("in production… from PriceOracle") whose entries are easily >25% off
-        // real prices, so a tight band would clamp an accurate live median to a
-        // stale constant — halving the gas→USD conversion in netProfitAfterGasUSD
-        // and letting gas-negative trades through. A 5x factor catches genuine
-        // thin-pool garbage without overriding legitimate price action.
-        const ref = getTokenPriceUSD(token);
-        if (Number.isFinite(ref) && ref > 0 && Number.isFinite(median) && median > 0) {
-            if (median > ref * MAX_USD_PRICE_DISTORTION || median < ref / MAX_USD_PRICE_DISTORTION) {
-                logRateLimited(`price:dev:${lower}`, `  ⚠️ Live USD price for ${lower.slice(0, 10)}… ($${median.toFixed(4)}) is >${MAX_USD_PRICE_DISTORTION}x from reference ($${ref.toFixed(4)}) — clamping (thin-pool distortion)`);
-                median = ref;
-            }
-        }
-        if (Number.isFinite(median) && median > 0) {
+        const median = allPrices[Math.floor(allPrices.length / 2)];
+        // M6b: distrust outlier SOURCES, not the stale static table. The
+        // reference table (TOKEN_PRICES_USD) is a placeholder that is never
+        // refreshed at runtime, so clamping to it can discard an accurate live
+        // price (WETH hardcoded $1900 vs real ~$2517) and corrupt the gas→USD
+        // conversion in netProfitAfterGasUSD. Instead, trust agreement across
+        // independent DEX quotes: when the cheapest and priciest live quotes
+        // disagree by more than MAX_USD_PRICE_SPREAD, the sources are too
+        // distorted to price reliably — skip (fail closed) rather than clamp.
+        const lo = allPrices[0];
+        const hi = allPrices[allPrices.length - 1];
+        if (lo > 0 && hi / lo > MAX_USD_PRICE_SPREAD) {
+            logRateLimited(`price:spread:${lower}`, `  ⚠️ Live USD quotes for ${lower.slice(0, 10)}… disagree ${(hi / lo).toFixed(1)}x ($${lo.toFixed(4)}…$${hi.toFixed(4)}) — sources too distorted, no reliable price`);
+            // fall through to the static-table last resort below
+        } else if (Number.isFinite(median) && median > 0) {
             _usdPriceCache.set(lower, { price: median, expiresAt: Date.now() + USD_PRICE_CACHE_TTL_MS });
             return median;
         }
