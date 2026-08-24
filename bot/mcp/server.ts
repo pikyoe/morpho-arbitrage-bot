@@ -167,8 +167,10 @@ async function getSymbol(address: string): Promise<string> {
     }
 }
 
+// USD-pegged stablecoins only. EURC is euro-pegged, so it is deliberately
+// excluded — hardcoding it to $1 would misprice it by the EUR/USD rate.
 const STABLE_LIKE = new Set([
-    TOKENS.USDC, TOKENS.USDT, TOKENS.DAI, TOKENS.USDe, TOKENS.RLUSD, TOKENS.EURC,
+    TOKENS.USDC, TOKENS.USDT, TOKENS.DAI, TOKENS.USDe, TOKENS.RLUSD,
 ].map(t => t.toLowerCase()));
 
 const usdPriceCache = new Map<string, { price: number; expiresAt: number }>();

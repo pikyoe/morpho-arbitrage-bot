@@ -121,10 +121,10 @@ export async function getTrendingBaseTokens(limit = 30): Promise<TrendingToken[]
             const volume24hUsd = basePairs.reduce((s, p) => s + (p.volume?.h24 ?? 0), 0);
             const txns24h = basePairs.reduce(
                 (s, p) => s + (p.txns?.h24?.buys ?? 0) + (p.txns?.h24?.sells ?? 0), 0);
-            const meta = basePairs.find(p => p.baseToken.address.toLowerCase() === address.toLowerCase())
-                ?.baseToken
-                ?? basePairs[0].baseToken
-                ?? basePairs[0].quoteToken;
+            const addr = address.toLowerCase();
+            const meta = basePairs.find(p => p.baseToken.address.toLowerCase() === addr)?.baseToken
+                ?? basePairs.find(p => p.quoteToken.address.toLowerCase() === addr)?.quoteToken
+                ?? basePairs[0].baseToken;
             const priceUsd = basePairs[0]?.priceUsd ? Number(basePairs[0].priceUsd) : null;
 
             const token: TrendingToken = {
