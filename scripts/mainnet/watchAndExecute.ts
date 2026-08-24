@@ -146,9 +146,11 @@ const VERBOSE = process.env.WATCH_VERBOSE === "true";
 const FRESH_QUOTE_GATE = process.env.FRESH_QUOTE_GATE !== "false";
 // M1: Configurable USD price cache TTL (default 10s, was hardcoded 30s).
 const USD_PRICE_CACHE_TTL_MS = Math.max(5_000, Number(process.env.USD_PRICE_CACHE_TTL_MS || 10_000));
-// M6b: Max accepted deviation between the live median USD price and the static
-// reference table before the live value is clamped (thin-pool distortion guard).
-const MAX_USD_PRICE_DEVIATION = Math.min(Math.max(Number(process.env.MAX_USD_PRICE_DEVIATION || 0.25), 0.05), 1);
+// M6b: Gross-distortion factor for the USD price guard. The live median is only
+// clamped to the static reference when it is >this factor off (default 5x). The
+// reference table is a placeholder, so a tight band would clamp accurate live
+// prices to stale constants; a 5x factor catches only genuine thin-pool garbage.
+const MAX_USD_PRICE_DISTORTION = Math.min(Math.max(Number(process.env.MAX_USD_PRICE_DISTORTION || 5), 2), 50);
 // C2: Slippage tolerance for 1inch reverse legs (default 2× SLIPPAGE_PCT).
 const INCH_REVERSE_SLIPPAGE_PCT = Math.min(
     Math.max(Number(process.env.INCH_REVERSE_SLIPPAGE_PCT || SLIPPAGE_PCT * 2), 0.1),
@@ -513,15 +515,17 @@ async function tokenUsdPrice(token: string): Promise<number> {
     if (allPrices.length >= 2) {
         allPrices.sort((a, b) => a - b);
         let median = allPrices[Math.floor(allPrices.length / 2)];
-        // M6b: sanity-bound the median against the static reference table. A
-        // 1-token probe on thin pools can be distorted by price impact, so a
-        // live median that deviates wildly from the known reference is clamped
-        // to the reference instead of poisoning the profit gate.
+        // M6b: clamp ONLY on gross (>5x) distortion, never on ordinary market
+        // moves. The static reference table (TOKEN_PRICES_USD) is a placeholder
+        // ("in production… from PriceOracle") whose entries are easily >25% off
+        // real prices, so a tight band would clamp an accurate live median to a
+        // stale constant — halving the gas→USD conversion in netProfitAfterGasUSD
+        // and letting gas-negative trades through. A 5x factor catches genuine
+        // thin-pool garbage without overriding legitimate price action.
         const ref = getTokenPriceUSD(token);
         if (Number.isFinite(ref) && ref > 0 && Number.isFinite(median) && median > 0) {
-            const deviation = Math.abs(median - ref) / ref;
-            if (deviation > MAX_USD_PRICE_DEVIATION) {
-                logRateLimited(`price:dev:${lower}`, `  ⚠️ Live USD price for ${lower.slice(0, 10)}… ($${median.toFixed(4)}) deviates ${(deviation * 100).toFixed(1)}% from reference ($${ref.toFixed(4)}) — clamping to reference (possible thin-pool distortion)`);
+            if (median > ref * MAX_USD_PRICE_DISTORTION || median < ref / MAX_USD_PRICE_DISTORTION) {
+                logRateLimited(`price:dev:${lower}`, `  ⚠️ Live USD price for ${lower.slice(0, 10)}… ($${median.toFixed(4)}) is >${MAX_USD_PRICE_DISTORTION}x from reference ($${ref.toFixed(4)}) — clamping (thin-pool distortion)`);
                 median = ref;
             }
         }
