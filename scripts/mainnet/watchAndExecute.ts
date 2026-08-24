@@ -148,9 +148,9 @@ const FRESH_QUOTE_GATE = process.env.FRESH_QUOTE_GATE !== "false";
 const USD_PRICE_CACHE_TTL_MS = Math.max(5_000, Number(process.env.USD_PRICE_CACHE_TTL_MS || 10_000));
 // M6b: When independent live DEX quotes for a token disagree by more than this
 // factor (cheapest vs priciest), the sources are too distorted to price reliably
-// — fail closed instead of trusting any single value. This never clamps an
-// accurate live price to the stale static table; it only rejects internal
-// disagreement among live sources.
+// — tokenUsdPrice throws (fail closed) so the caller skips the trade rather than
+// trusting any single value or the stale static table. This never clamps an
+// accurate live price; it only rejects internal disagreement among live sources.
 const MAX_USD_PRICE_SPREAD = Math.min(Math.max(Number(process.env.MAX_USD_PRICE_SPREAD || 3), 1.5), 20);
 // C2: Slippage tolerance for 1inch reverse legs (default 2× SLIPPAGE_PCT).
 const INCH_REVERSE_SLIPPAGE_PCT = Math.min(
@@ -523,13 +523,14 @@ async function tokenUsdPrice(token: string): Promise<number> {
         // conversion in netProfitAfterGasUSD. Instead, trust agreement across
         // independent DEX quotes: when the cheapest and priciest live quotes
         // disagree by more than MAX_USD_PRICE_SPREAD, the sources are too
-        // distorted to price reliably — skip (fail closed) rather than clamp.
+        // distorted to price reliably — fail closed (throw) so the caller skips
+        // the trade, rather than falling back to the stale table.
         const lo = allPrices[0];
         const hi = allPrices[allPrices.length - 1];
         if (lo > 0 && hi / lo > MAX_USD_PRICE_SPREAD) {
-            logRateLimited(`price:spread:${lower}`, `  ⚠️ Live USD quotes for ${lower.slice(0, 10)}… disagree ${(hi / lo).toFixed(1)}x ($${lo.toFixed(4)}…$${hi.toFixed(4)}) — sources too distorted, no reliable price`);
-            // fall through to the static-table last resort below
-        } else if (Number.isFinite(median) && median > 0) {
+            throw new Error(`Live USD quotes for ${lower.slice(0, 10)}… disagree ${(hi / lo).toFixed(1)}x ($${lo.toFixed(4)}…$${hi.toFixed(4)}) — sources too distorted, no reliable price`);
+        }
+        if (Number.isFinite(median) && median > 0) {
             _usdPriceCache.set(lower, { price: median, expiresAt: Date.now() + USD_PRICE_CACHE_TTL_MS });
             return median;
         }
@@ -1630,7 +1631,15 @@ async function main() {
                 if (amountBack <= amountIn) continue;
 
                 const profit = amountBack - amountIn;
-                const profitUSD = await tokenAmountToUsd(profit, WATCH_PAIR_A);
+                // Fail closed: if the USD price is unreliable (live sources
+                // disagree), skip this sell leg instead of crashing the watcher.
+                let profitUSD: number;
+                try {
+                    profitUSD = await tokenAmountToUsd(profit, WATCH_PAIR_A);
+                } catch (e: any) {
+                    logRateLimited(`price:single:${WATCH_PAIR_A}`, `  ⚠️ USD price unreliable for ${WATCH_PAIR_A.slice(0,6)} (${e?.message || String(e)}) — skipping sell leg`);
+                    continue;
+                }
                 const spreadPct = Number((profit * 1000000n) / amountIn) / 10000;
 
                 if (VERBOSE) {
