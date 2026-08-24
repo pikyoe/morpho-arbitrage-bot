@@ -1,5 +1,4 @@
 import { network } from "hardhat";
-import "dotenv/config";
 
 
 async function main() {

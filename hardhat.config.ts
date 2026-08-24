@@ -1,6 +1,6 @@
 import { defineConfig } from "hardhat/config";
 import hardhatEthers from "@nomicfoundation/hardhat-ethers";
-import dotenv from "dotenv";
+import { loadEnvFile } from "./bot/utils/envFile.js";
 
 const args = process.argv;
 const networkArgIndex = args.findIndex((arg) => arg === "--network");
@@ -21,7 +21,7 @@ const envFile =
     ? ".env.sepolia"
     : ".env.mainnet");
 
-dotenv.config({ path: envFile });
+loadEnvFile(envFile);
 
 console.log(`Loaded env file: ${envFile}`);
 export default defineConfig({

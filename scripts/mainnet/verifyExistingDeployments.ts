@@ -1,5 +1,4 @@
-import "dotenv/config";
-import * as dotenv from "dotenv";
+import { loadEnvFile } from "../../bot/utils/envFile.js";
 import { Contract, JsonRpcProvider, getAddress, isAddress } from "ethers";
 
 const DEPLOYER = "0x5E2F886b10a49685317De61f521b0Cfa59579d60";
@@ -19,7 +18,7 @@ type AddressMap = Record<string, string>;
 
 function loadConfiguredAddresses(): AddressMap {
   if (process.env.ENV_FILE) {
-    const result = dotenv.config({ path: process.env.ENV_FILE });
+    const result = loadEnvFile(process.env.ENV_FILE);
     if (result.error) throw new Error(`Unable to load ${process.env.ENV_FILE}: ${result.error.message}`);
   }
 

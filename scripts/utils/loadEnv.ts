@@ -1,4 +1,4 @@
-import * as dotenv from "dotenv";
+import { loadEnvFile } from "../../bot/utils/envFile.js";
 import * as path from "path";
 
 export function loadEnvForNetwork(hre: any) {
@@ -18,7 +18,7 @@ export function loadEnvForNetwork(hre: any) {
   }
 
   const full = path.join(root, envFile);
-  const result = dotenv.config({ path: full });
+  const result = loadEnvFile(full);
 
   if (result.error) {
     console.warn(`No env file loaded at ${full} (proceeding with existing environment)`);
