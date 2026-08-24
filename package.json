@@ -6,6 +6,7 @@
   "private": true,
   "scripts": {
     "bot": "ENV_FILE=.env.mainnet tsx scripts/mainnet/watchAndExecute.ts",
+    "bot:targeted": "ENV_FILE=.env.mainnet tsx scripts/mainnet/watchAndExecuteTargeted.ts",
     "build": "tsc",
     "clean": "rm -rf dist",
     "compile": "hardhat compile",
