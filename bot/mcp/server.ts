@@ -25,6 +25,7 @@ import {
 } from "ethers";
 
 import { PoolCache } from "../scanner/PoolCache.js";
+import { SubgraphPoolLoader } from "../scanner/SubgraphPoolLoader.js";
 import { UniswapV3DexProvider } from "../scanner/quote/UniswapV3DexProvider.js";
 import { SushiSwapDexProvider } from "../scanner/quote/SushiSwapDexProvider.js";
 import { PancakeSwapDexProvider } from "../scanner/quote/PancakeSwapDexProvider.js";
@@ -44,6 +45,10 @@ import { loadEnvFile } from "../utils/envFile.js";
 // loadEnvFile has no advertising/telemetry output (unlike dotenv v17), so the
 // protocol channel is never polluted.
 loadEnvFile(process.env.ENV_FILE ?? ".env.mainnet");
+
+// The subgraph loader and some DEX providers log via console.log; reroute all
+// of it to stderr so the stdio protocol channel stays valid JSON-RPC.
+console.log = console.error;
 
 const RPC_URLS = [...new Set([
     process.env.BASE_RPC_URL_1 || process.env.BASE_RPC_URL || process.env.RPC_URL,
@@ -82,6 +87,14 @@ const FLASH_LOAN_FEE_BPS = 0;
 
 function buildDexProviders(): DexQuoteProvider[] {
     const providers: DexQuoteProvider[] = [];
+    // Aerodrome first: its quote path is 3 sequential RPC calls (getPool,
+    // getReserves, getAmountsOut), so it is the most sensitive to the rate
+    // limits that Uniswap's 4-fee-tier burst triggers on public RPCs.
+    const aerodromeRouter = process.env.AERODROME_ROUTER_ADDRESS || process.env.AERODROME_ROUTER;
+    if (aerodromeRouter && process.env.AERODROME_FACTORY_ADDRESS) {
+        providers.push(new AerodromeDexProvider(
+            provider, poolCache, aerodromeRouter, process.env.AERODROME_FACTORY_ADDRESS));
+    }
     if (process.env.UNISWAP_QUOTER_ADDRESS && process.env.UNISWAP_FACTORY_ADDRESS) {
         providers.push(new UniswapV3DexProvider(
             provider, poolCache,
@@ -97,11 +110,6 @@ function buildDexProviders(): DexQuoteProvider[] {
             provider, poolCache,
             process.env.PANCAKESWAP_QUOTER_ADDRESS, process.env.PANCAKESWAP_FACTORY_ADDRESS));
     }
-    const aerodromeRouter = process.env.AERODROME_ROUTER_ADDRESS || process.env.AERODROME_ROUTER;
-    if (aerodromeRouter && process.env.AERODROME_FACTORY_ADDRESS) {
-        providers.push(new AerodromeDexProvider(
-            provider, poolCache, aerodromeRouter, process.env.AERODROME_FACTORY_ADDRESS));
-    }
     return providers;
 }
 
@@ -113,18 +121,22 @@ const dexProviders = buildDexProviders();
  * backoff so a single slow/flaky provider does not drop a whole DEX route.
  */
 async function quoteWithRetry(p: DexQuoteProvider, request: QuoteRequest): Promise<QuoteResult | null> {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
         try {
             const q = await p.quote(request);
             if (q && q.amountOut > 0n) return q;
         } catch { /* fall through to retry */ }
-        if (attempt === 0) await new Promise(r => setTimeout(r, 250));
+        if (attempt < 2) await new Promise(r => setTimeout(r, 750 * (attempt + 1)));
     }
     return null;
 }
 
 async function quoteAll(request: QuoteRequest): Promise<QuoteResult[]> {
-    const results = await Promise.all(dexProviders.map(p => quoteWithRetry(p, request)));
+    // Sequential on purpose: public Base RPCs rate-limit concurrent quoter
+    // calls, and firing all providers at once makes slower ones (Aerodrome
+    // does getPool → getReserves → getAmountsOut) intermittently return null.
+    const results: (QuoteResult | null)[] = [];
+    for (const p of dexProviders) results.push(await quoteWithRetry(p, request));
     return results.filter((q): q is QuoteResult => q !== null);
 }
 
@@ -641,6 +653,29 @@ server.tool(
 // ------------------------------------------------------------------
 
 async function main() {
+    // Warm the pool cache from configured subgraphs so the cache-only DEX
+    // providers (SushiSwap, PancakeSwap, Aerodrome) have routes to quote —
+    // same startup sequence as the watcher.
+    const subgraphLoader = new SubgraphPoolLoader(poolCache);
+    const poolLimit = Number(process.env.SUBGRAPH_POOL_LIMIT || 20);
+    for (const [name, subgraphUrl] of [
+        ["UniswapV3", process.env.UNISWAP_SUBGRAPH_URL],
+        ["SushiSwap", process.env.SUSHISWAP_SUBGRAPH_URL],
+        ["PancakeSwap", process.env.PANCAKESWAP_SUBGRAPH_URL],
+        ["Aerodrome", process.env.AERODROME_SUBGRAPH_URL],
+    ] as const) {
+        if (!subgraphUrl) continue;
+        try {
+            if (name === "Aerodrome") await subgraphLoader.loadAerodrome(subgraphUrl, poolLimit);
+            else if (name === "SushiSwap") await subgraphLoader.loadSushiSwap(subgraphUrl, poolLimit);
+            else if (name === "PancakeSwap") await subgraphLoader.loadPancakeSwap(subgraphUrl, poolLimit);
+            else await subgraphLoader.loadUniswap(subgraphUrl, poolLimit);
+        } catch (e) {
+            console.error(`[mcp] ${name} subgraph load failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+    console.error(`[mcp] pool cache warmed: ${poolCache.size()} pools`);
+
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error(`[mcp] morpho-arbitrage-bot MCP server running (providers: ${dexProviders.map(p => p.getDexName()).join(", ") || "none"})`);
